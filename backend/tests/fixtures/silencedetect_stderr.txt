@@ -1,0 +1,8 @@
+Input #0, wav, from 'audio.wav':
+  Duration: 00:00:20.00, bitrate: 256 kb/s
+[silencedetect @ 0000019b8c0f5c40] silence_start: 1.504
+[silencedetect @ 0000019b8c0f5c40] silence_end: 2.31 | silence_duration: 0.806
+size=N/A time=00:00:05.00 bitrate=N/A speed= 500x
+[silencedetect @ 0000019b8c0f5c40] silence_start: 7.95
+[silencedetect @ 0000019b8c0f5c40] silence_end: 10.02 | silence_duration: 2.07
+[out#0/null @ 0000019b8c0e2a00] video:0KiB audio:625KiB

@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# Data & secrets
+/data/
+.env
+*.partial.mp4
+# Node
+node_modules/
+dist/
+# Dokumen perencanaan buatan AI (PRD, desain, rencana) - hanya disimpan lokal
+docs/

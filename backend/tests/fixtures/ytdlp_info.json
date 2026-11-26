@@ -1,0 +1,12 @@
+{
+  "id": "abcDEF12345",
+  "title": "Podcast Contoh: Ngobrolin Bisnis",
+  "channel": "Kanal Contoh",
+  "duration": 3612.0,
+  "filesize_approx": 734003200,
+  "heatmap": [
+    {"start_time": 0.0, "end_time": 36.12, "value": 1.0},
+    {"start_time": 36.12, "end_time": 72.24, "value": 0.42},
+    {"start_time": 72.24, "end_time": 108.36, "value": 0.31}
+  ]
+}

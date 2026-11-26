@@ -1,0 +1,9 @@
+{
+  "canvas": {"width": 1080, "height": 1920},
+  "font": {"family": "Montserrat ExtraBold", "file": "Montserrat-ExtraBold.ttf"},
+  "hook": {"size": 84, "color": "#FFFFFF", "outline": "#000000", "outline_width": 7, "margin_top": 260, "max_chars_per_line": 18},
+  "presets": {
+    "klasik":     {"size": 72, "color": "#FFFFFF", "highlight": null,      "outline": "#000000", "outline_width": 6, "margin_bottom": 420},
+    "sorot_kata": {"size": 72, "color": "#FFFFFF", "highlight": "#FFE14D", "outline": "#000000", "outline_width": 6, "margin_bottom": 420}
+  }
+}

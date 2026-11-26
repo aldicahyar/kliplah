@@ -1,0 +1,28 @@
+[project]
+name = "kliplah"
+version = "0.1.0"
+description = "Local AI clipper: long Indonesian podcasts to vertical short clips"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "yt-dlp",
+    "faster-whisper>=1.1",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "scenedetect[opencv]>=0.6.4",
+    "mediapipe>=0.10.14",
+    "numpy",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-timeout"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["slow: needs real ffmpeg/models; run with -m slow"]
+addopts = "-m 'not slow'"
+timeout = 120
