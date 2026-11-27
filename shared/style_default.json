@@ -1,0 +1,51 @@
+{
+  "font_family": "Montserrat ExtraBold",
+  "subtitle": {
+    "enabled": true,
+    "mode": "line",
+    "size": 104,
+    "color": "#FFFFFF",
+    "outline_color": "#000000",
+    "outline_width": 8,
+    "highlight_color": "#FFE14D",
+    "uppercase": false,
+    "words_per_line": 4,
+    "box": {
+      "enabled": false,
+      "color": "#000000",
+      "opacity": 0.6,
+      "padding": 16,
+      "radius": 12
+    },
+    "speaker_emoji": false,
+    "position": {
+      "anchor": "bottom",
+      "offset_y": 420
+    },
+    "language_mode": "target"
+  },
+  "hook": {
+    "enabled": true,
+    "duration": 3.0,
+    "size": 96,
+    "color": "#FFFFFF",
+    "outline_color": "#000000",
+    "outline_width": 7,
+    "position": {
+      "anchor": "top",
+      "offset_y": 260
+    },
+    "box": {
+      "enabled": false,
+      "color": "#000000",
+      "opacity": 0.6,
+      "padding": 16,
+      "radius": 12
+    }
+  },
+  "logo": null,
+  "background": {
+    "type": "blur",
+    "color": "#000000"
+  }
+}

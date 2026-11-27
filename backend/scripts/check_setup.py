@@ -7,12 +7,14 @@ from pathlib import Path
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from app.core.config import get_settings  # noqa: E402
+from app.core.config import Settings, get_settings  # noqa: E402
+
+PROBE_TIMEOUT = 2  # seconds; also used by the API health check, which must answer quickly
 
 
 def _ollama_tags(url: str) -> list[str] | None:
     try:
-        r = httpx.get(f"{url}/api/tags", timeout=3)
+        r = httpx.get(f"{url}/api/tags", timeout=PROBE_TIMEOUT)
         r.raise_for_status()
         return [m["name"] for m in r.json().get("models", [])]
     except Exception:
@@ -22,12 +24,16 @@ def _ollama_tags(url: str) -> list[str] | None:
 def _ffmpeg_has_libass(ffmpeg: str | None) -> bool:
     if not ffmpeg:
         return False
-    out = subprocess.run([ffmpeg, "-hide_banner", "-version"], capture_output=True, text=True).stdout
+    try:
+        out = subprocess.run([ffmpeg, "-hide_banner", "-version"], capture_output=True, text=True,
+                             timeout=PROBE_TIMEOUT).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
     return "--enable-libass" in out
 
 
-def collect() -> dict[str, bool | float]:
-    s = get_settings()
+def collect(settings: Settings | None = None) -> dict[str, bool | float]:
+    s = settings or get_settings()
     ffmpeg = shutil.which("ffmpeg")
     tags = _ollama_tags(s.ollama_url)
     data = Path(s.data_dir).resolve()

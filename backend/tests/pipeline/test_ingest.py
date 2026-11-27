@@ -108,3 +108,49 @@ def test_ingest_youtube_skips_when_checkpoint_exists(monkeypatch, tmp_path, info
     monkeypatch.setattr(ingest, "YoutubeDL", None)  # would crash if used
     src, meta = ingest_youtube("https://youtu.be/dQw4w9WgXcQ", s)
     assert src == d / "source.mp4" and meta.project_id == "dQw4w9WgXcQ"
+
+
+class _DownloadingYDL:
+    """Fake yt-dlp that 'downloads' by writing the output file named by outtmpl."""
+    info: dict = {}
+
+    def __init__(self, opts):
+        self.opts = opts
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def extract_info(self, url, download=False):
+        return self.info
+
+    def download(self, urls):
+        Path(self.opts["outtmpl"].replace("%(ext)s", "mp4")).write_bytes(b"v")
+
+
+def test_ingest_youtube_project_id_overrides_folder(monkeypatch, tmp_path, info):
+    info["id"] = "dQw4w9WgXcQ"
+    _DownloadingYDL.info = info
+    monkeypatch.setattr(ingest, "YoutubeDL", _DownloadingYDL)
+    monkeypatch.setattr(ingest, "ensure_disk_space", lambda p, n: None)
+    s = Settings(_env_file=None, data_dir=tmp_path)
+    src, meta = ingest_youtube("https://youtu.be/dQw4w9WgXcQ", s, project_id="proj-abc")
+    d = tmp_path / "projects" / "proj-abc"
+    assert src == d / "source.mp4" and src.exists()
+    assert meta.project_id == "proj-abc" and meta.video_id == "dQw4w9WgXcQ"
+    assert json.loads((d / "meta.json").read_text(encoding="utf-8"))["project_id"] == "proj-abc"
+    assert not (tmp_path / "projects" / "dQw4w9WgXcQ").exists()
+
+
+def test_ingest_file_project_id_overrides_folder(monkeypatch, tmp_path):
+    video = tmp_path / "upload.mp4"
+    video.write_bytes(b"tiny")
+    monkeypatch.setattr(ingest, "probe_duration", lambda p: 12.5)
+    s = Settings(_env_file=None, data_dir=tmp_path / "data")
+    src, meta = ingest.ingest_file(video, s, project_id="proj-xyz")
+    d = tmp_path / "data" / "projects" / "proj-xyz"
+    assert src == d / "source.mp4" and src.read_bytes() == b"tiny"
+    assert meta.project_id == "proj-xyz" and meta.source_type == "upload" and meta.duration == 12.5
+    assert json.loads((d / "meta.json").read_text(encoding="utf-8"))["project_id"] == "proj-xyz"

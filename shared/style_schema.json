@@ -1,0 +1,301 @@
+{
+  "$defs": {
+    "Background": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "default": "blur",
+          "enum": [
+            "blur",
+            "solid"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "color": {
+          "default": "#000000",
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "title": "Color",
+          "type": "string"
+        }
+      },
+      "title": "Background",
+      "type": "object"
+    },
+    "BoxStyle": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": false,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "color": {
+          "default": "#000000",
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "title": "Color",
+          "type": "string"
+        },
+        "opacity": {
+          "default": 0.6,
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Opacity",
+          "type": "number"
+        },
+        "padding": {
+          "default": 16,
+          "minimum": 0,
+          "title": "Padding",
+          "type": "integer"
+        },
+        "radius": {
+          "default": 12,
+          "minimum": 0,
+          "title": "Radius",
+          "type": "integer"
+        }
+      },
+      "title": "BoxStyle",
+      "type": "object"
+    },
+    "HookStyle": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "duration": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "number"
+            },
+            {
+              "const": "full",
+              "type": "string"
+            }
+          ],
+          "default": 3.0,
+          "title": "Duration"
+        },
+        "size": {
+          "default": 96,
+          "exclusiveMinimum": 0,
+          "title": "Size",
+          "type": "integer"
+        },
+        "color": {
+          "default": "#FFFFFF",
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "title": "Color",
+          "type": "string"
+        },
+        "outline_color": {
+          "default": "#000000",
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "title": "Outline Color",
+          "type": "string"
+        },
+        "outline_width": {
+          "default": 7,
+          "minimum": 0,
+          "title": "Outline Width",
+          "type": "integer"
+        },
+        "position": {
+          "$ref": "#/$defs/Position"
+        },
+        "box": {
+          "$ref": "#/$defs/BoxStyle"
+        }
+      },
+      "title": "HookStyle",
+      "type": "object"
+    },
+    "LogoStyle": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "asset_id": {
+          "title": "Asset Id",
+          "type": "string"
+        },
+        "anchor": {
+          "enum": [
+            "top-left",
+            "top-right",
+            "bottom-left",
+            "bottom-right",
+            "top-center"
+          ],
+          "title": "Anchor",
+          "type": "string"
+        },
+        "size": {
+          "exclusiveMinimum": 0,
+          "title": "Size",
+          "type": "integer"
+        },
+        "opacity": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Opacity",
+          "type": "number"
+        }
+      },
+      "required": [
+        "enabled",
+        "asset_id",
+        "anchor",
+        "size",
+        "opacity"
+      ],
+      "title": "LogoStyle",
+      "type": "object"
+    },
+    "Position": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor": {
+          "enum": [
+            "top",
+            "middle",
+            "bottom"
+          ],
+          "title": "Anchor",
+          "type": "string"
+        },
+        "offset_y": {
+          "title": "Offset Y",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "anchor",
+        "offset_y"
+      ],
+      "title": "Position",
+      "type": "object"
+    },
+    "SubtitleStyle": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "mode": {
+          "default": "line",
+          "enum": [
+            "line",
+            "highlight_word"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "size": {
+          "default": 104,
+          "exclusiveMinimum": 0,
+          "title": "Size",
+          "type": "integer"
+        },
+        "color": {
+          "default": "#FFFFFF",
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "title": "Color",
+          "type": "string"
+        },
+        "outline_color": {
+          "default": "#000000",
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "title": "Outline Color",
+          "type": "string"
+        },
+        "outline_width": {
+          "default": 8,
+          "minimum": 0,
+          "title": "Outline Width",
+          "type": "integer"
+        },
+        "highlight_color": {
+          "default": "#FFE14D",
+          "pattern": "^#[0-9A-Fa-f]{6}$",
+          "title": "Highlight Color",
+          "type": "string"
+        },
+        "uppercase": {
+          "default": false,
+          "title": "Uppercase",
+          "type": "boolean"
+        },
+        "words_per_line": {
+          "default": 4,
+          "maximum": 4,
+          "minimum": 1,
+          "title": "Words Per Line",
+          "type": "integer"
+        },
+        "box": {
+          "$ref": "#/$defs/BoxStyle"
+        },
+        "speaker_emoji": {
+          "default": false,
+          "title": "Speaker Emoji",
+          "type": "boolean"
+        },
+        "position": {
+          "$ref": "#/$defs/Position"
+        },
+        "language_mode": {
+          "default": "target",
+          "enum": [
+            "target",
+            "bilingual",
+            "original"
+          ],
+          "title": "Language Mode",
+          "type": "string"
+        }
+      },
+      "title": "SubtitleStyle",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "font_family": {
+      "default": "Montserrat ExtraBold",
+      "title": "Font Family",
+      "type": "string"
+    },
+    "subtitle": {
+      "$ref": "#/$defs/SubtitleStyle"
+    },
+    "hook": {
+      "$ref": "#/$defs/HookStyle"
+    },
+    "logo": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LogoStyle"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "background": {
+      "$ref": "#/$defs/Background"
+    }
+  },
+  "title": "Style",
+  "type": "object"
+}

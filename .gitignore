@@ -6,6 +6,10 @@ __pycache__/
 .superpowers/
 # Data & secrets
 /data/
+/backend/data/
+*.db
+*.db-wal
+*.db-shm
 .env
 *.partial.mp4
 # Node
