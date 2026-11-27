@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:4b"
     max_video_height: int = 1080
+    default_moment_source: str = "claude_manual"
+    api_host: str = "127.0.0.1"
+    api_port: int = 8000
 
 
 @lru_cache

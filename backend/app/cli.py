@@ -1,201 +1,292 @@
-"""Kliplah command line (M1): run the whole pipeline, re-analyze with another LLM, or benchmark Whisper.
+"""Kliplah command line: a thin client over the same services, database and worker as the API (spec 10.6).
 
-    python -m app.cli run <youtube-url | video-file> [--no-render]
+Every command writes to `DATA_DIR/kliplah.db` and runs its jobs synchronously through the worker
+(`worker_main(once=True)` until the project's queue is empty). `--queue-only` only enqueues.
+
+    python -m app.cli run <youtube-url | video-file> [--moments ollama|claude] [--no-render]
     python -m app.cli analyze <project_id> --llm-model gemma3:4b
     python -m app.cli bench-whisper <youtube-url | video-file> --models small medium --seconds 300
+    python -m app.cli migrate-m1
+    python -m app.cli recover          # only when no worker is running
 
 Without Ollama, using Claude through your own subscription (no API cost):
-    python -m app.cli export-transcript <youtube-url | video-file>   # writes untuk_claude.md
-    python -m app.cli import-moments <project_id> <reply.json>         # renders Claude's picks
+    python -m app.cli export-transcript <youtube-url | video-file>        # writes untuk_claude*.md
+    python -m app.cli export-moments <project_id>                         # export again, same project
+    python -m app.cli import-moments <project_id> <reply.json> [--part K]   # uses Claude's picks
+
+Jobs run here claim only this project's jobs and never reset another worker's `running` job: while
+`scripts/dev.py` is working on the project, the CLI waits for it.
 """
 import argparse
 import logging
+import shutil
 import sys
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 
-from app.core.config import BACKEND_DIR, Settings, get_settings
-from app.core.fs import atomic_write_json, project_dir, read_json
-from app.core.models import ClipPlan, Transcript, VideoMeta
-from app.pipeline.analyze import analyze, import_external, transcript_lines
-from app.pipeline.audio import detect_silences, extract_audio
-from app.pipeline.corrections import load_corrections
+from sqlalchemy import Engine
+from sqlmodel import Session, col, select
+
+from app import migrate_m1
+from app.core.config import Settings, get_settings
+from app.core.errors import AppError
+from app.core.fs import project_dir
+from app.db.engine import get_engine, init_db, session_scope
+from app.db.tables import Clip, Job, Project, utcnow
+from app.pipeline.audio import extract_audio
 from app.pipeline.ingest import IngestError, ingest_file, ingest_youtube
-from app.pipeline.llm_json import parse_llm_json, render_prompt
-from app.pipeline.render import RenderError, render_clip
-from app.pipeline.reframe import reframe_clip
-from app.pipeline.report import build_report, clip_folder
-from app.pipeline.snap import neighbor_bounds, snap_edges
-from app.pipeline.subtitles import group_lines, load_presets
-from app.pipeline.transcribe import transcribe
-from app.providers.llm import OllamaClient
 from app.providers.transcriber import FasterWhisperTranscriber
+from app.services import clips as clip_service
+from app.services import moments, projects
+from app.services._common import fetch
+from app.worker import queue
+from app.worker.main import recover_startup, worker_main
+from app.worker.process import STAGES, ProcessDeps, transcript_dir
 
 log = logging.getLogger("kliplah")
-FONTS_DIR = BACKEND_DIR / "assets" / "fonts"
-SNAP_SLACK = 3.0  # edge refinement may stretch a clip slightly past max_sec
+
+# exit code 2: the user can fix the input; everything else (retryable or runtime) exits 1
+USER_ERRORS = frozenset({"INVALID_URL", "INVALID_IMPORT", "VALIDATION", "NOT_FOUND", "INVALID_STATE",
+                         "VIDEO_UNAVAILABLE", "DOWNLOAD_BLOCKED", "DISK_FULL"})
+PAUSE_STATUSES = ("awaiting_moments", "ready")
+MOMENT_SOURCES = {"ollama": "ollama", "claude": "claude_manual"}
+WAIT_POLL = 2.0  # seconds between status checks while another worker runs the project's job
+WAITING = ("Job sedang dikerjakan worker lain; menunggu… (jika worker itu sudah mati, hentikan perintah ini "
+           "lalu jalankan `python -m app.cli recover`)")
+LLM_MODEL_HELP = ("model Ollama; hanya berlaku untuk job yang dijalankan CLI ini sendiri (tidak disimpan di project)")
 
 
-@dataclass
-class RunOptions:
-    max_clips: int = 8
-    min_sec: int = 30
-    max_sec: int = 90
-    whisper_model: str = "small"
-    llm_model: str = "qwen3:4b"
-    render: bool = True
+def _process_deps(settings: Settings) -> ProcessDeps:
+    """Pipeline of process jobs run by the CLI; the single seam tests replace."""
+    return ProcessDeps(settings=settings)
 
 
-def _safe(name: str) -> str:
-    return name.replace(":", "-").replace("/", "-")
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
 
 
-class _Timer:
-    def __init__(self):
-        self.timings: dict[str, float] = {}
+def _engine(settings: Settings) -> Engine:
+    engine = get_engine(settings)
+    init_db(engine)
+    return engine
 
-    def run(self, name, fn, *a, **kw):
-        t0 = time.monotonic()
+
+def _is_url(source: str) -> bool:
+    if Path(source).is_file():
+        return False
+    return source.lower().startswith(("http://", "https://", "www.", "youtu"))
+
+
+def _with_models(settings: Settings, args) -> Settings:
+    update = {}
+    if getattr(args, "whisper_model", None):
+        update["whisper_model"] = args.whisper_model
+    if getattr(args, "llm_model", None):
+        update["ollama_model"] = args.llm_model
+    return settings.model_copy(update=update) if update else settings
+
+
+# ---------- running jobs synchronously ----------
+
+def _failed_job_error(session: Session, project_id: str) -> AppError:
+    job = session.exec(select(Job).where(Job.project_id == project_id, Job.status == "failed")
+                       .order_by(col(Job.finished_at).desc())).first()
+    if job is None:
+        return AppError("UNKNOWN", f"Project {project_id} gagal diproses.")
+    return AppError(job.error_code or "UNKNOWN", job.error_message or "Project gagal diproses.")
+
+
+def _drain(engine: Engine, settings: Settings, project_id: str, *, stop_at_pause: bool = True) -> Project:
+    """Run the project's jobs until it has no queued/running job (or pauses at awaiting_moments/ready).
+
+    Only this project's jobs are claimed and nothing is recovered. A job `running` while the CLI is between
+    jobs belongs to another worker: the CLI waits for it instead. A failed project raises its job's error.
+    """
+    deps = _process_deps(settings)
+    noted = False
+    while True:
+        with Session(engine) as s:
+            project = fetch(s, Project, project_id, "Project")
+            if project.status == "failed":
+                raise _failed_job_error(s, project_id)
+            active = s.exec(select(Job).where(Job.project_id == project_id,
+                                              col(Job.status).in_(queue.ACTIVE_STATUSES))).all()
+            s.expunge(project)
+        if not active or (stop_at_pause and project.status in PAUSE_STATUSES):
+            return project
+        if any(j.status == "running" for j in active):
+            if not noted:
+                print(WAITING, flush=True)
+                noted = True
+            _sleep(WAIT_POLL)
+            continue
+        worker_main(settings, once=True, sleep=_sleep, process_deps=deps, recover=False, project_id=project_id)
+
+
+def _print_export(engine: Engine, settings: Settings, project: Project) -> list[Path]:
+    parts = moments.export_parts(engine, project.id, settings)
+    tdir = transcript_dir(settings, project)
+    paths = [tdir / p["filename"] for p in parts]
+    print(f"Project ID: {project.id}")
+    print("Berikan isi file berikut ke Claude (Claude Code atau claude.ai), satu per satu:")
+    for p in paths:
+        print(f"  {p}")
+    print("Simpan setiap balasan sebagai .json, lalu:")
+    for p in parts:
+        part = f" --part {p['part']}" if p["of"] > 1 else ""
+        print(f"  uv run python -m app.cli import-moments {project.id} <file-balasan.json>{part}")
+    return paths
+
+
+def _render_all(engine: Engine, settings: Settings, project_id: str) -> list[Path]:
+    """Approve every proposed clip (M1 behaviour), render, and return the output files."""
+    proposed = [c.id for c in clip_service.list_clips(engine, project_id) if c.status == "proposed"]
+    clip_service.bulk(engine, proposed, "approve")
+    _drain(engine, settings, project_id, stop_at_pause=False)
+    rows = clip_service.list_clips(engine, project_id)
+    failed = [c for c in rows if c.id in proposed and c.status == "render_failed"]
+    outputs = [Path(c.output_path) for c in rows if c.status == "rendered" and c.output_path]
+    for path in outputs:
+        print(f"  {path}")
+    if failed:
+        with Session(engine) as s:
+            job = s.exec(select(Job).where(Job.clip_id == failed[0].id, Job.status == "failed")
+                         .order_by(col(Job.finished_at).desc())).first()
+        code = job.error_code if job and job.error_code else "UNKNOWN"
+        msg = job.error_message if job and job.error_message else "Render gagal."
+        raise AppError(code, f"{len(failed)} klip gagal dirender. {msg}")
+    return outputs
+
+
+def _finish(engine: Engine, settings: Settings, project: Project, render: bool) -> Path:
+    """After the process job: export for Claude when awaiting moments, otherwise list (and render) the clips."""
+    if project.status == "awaiting_moments":
+        _print_export(engine, settings, project)
+        return project_dir(settings, project.id)
+    rows = clip_service.list_clips(engine, project.id)
+    print(f"{len(rows)} klip untuk project {project.id}:")
+    for c in rows:
+        print(f"  #{c.rank} skor {c.score} [{c.status}] {c.hook_text}")
+    if render:
+        _render_all(engine, settings, project.id)
+    return project_dir(settings, project.id)
+
+
+# ---------- commands ----------
+
+def _stage_upload(source: str, settings: Settings) -> Path:
+    """Copy a local video next to the uploads so `create_project` can move the copy, never the user's file."""
+    path = Path(source)
+    if not path.is_file():
+        raise AppError("INVALID_URL", f"File tidak ditemukan: {path}")
+    tmp = Path(settings.data_dir) / "uploads" / "_incoming" / uuid.uuid4().hex / path.name
+    tmp.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, tmp)
+    return tmp
+
+
+def _create(engine: Engine, settings: Settings, source: str, **options) -> Project:
+    if _is_url(source):
+        project = projects.create_project(engine, url=source, settings=settings, **options)
+    else:
+        tmp = _stage_upload(source, settings)
         try:
-            return fn(*a, **kw)
+            project = projects.create_project(engine, upload_path=tmp, original_filename=Path(source).name,
+                                              settings=settings, **options)
         finally:
-            self.timings[name] = round(self.timings.get(name, 0) + time.monotonic() - t0, 1)
+            shutil.rmtree(tmp.parent, ignore_errors=True)
+    print(f"Project ID: {project.id}")
+    return project
 
 
-def _ingest(source: str, settings: Settings) -> tuple[Path, VideoMeta]:
-    if source.lower().startswith(("http://", "https://", "www.", "youtu")):
+def cmd_run(args, settings: Settings) -> Path:
+    settings = _with_models(settings, args)
+    engine = _engine(settings)
+    project = _create(engine, settings, args.source, content_type=args.type,
+                      moment_source=MOMENT_SOURCES[args.moments] if args.moments else None,
+                      max_clips=args.max_clips, min_clip_sec=args.min_sec, max_clip_sec=args.max_sec)
+    if args.queue_only:
+        print("Diantrekan; worker (scripts/dev.py) akan memprosesnya.")
+        return project_dir(settings, project.id)
+    project = _drain(engine, settings, project.id)
+    return _finish(engine, settings, project, render=not args.no_render)
+
+
+def cmd_export(args, settings: Settings) -> Path:
+    settings = _with_models(settings, args)
+    engine = _engine(settings)
+    project = _create(engine, settings, args.source, content_type=args.type,
+                      moment_source="claude_manual", max_clips=args.max_clips, min_clip_sec=args.min_sec,
+                      max_clip_sec=args.max_sec)
+    if args.queue_only:
+        print("Diantrekan; setelah project menunggu momen, jalankan:")
+        print(f"  uv run python -m app.cli export-moments {project.id}")
+        return project_dir(settings, project.id)
+    project = _drain(engine, settings, project.id)
+    if project.status != "awaiting_moments":
+        raise AppError("INVALID_STATE", f"Project berstatus '{project.status}', bukan menunggu momen.")
+    return _print_export(engine, settings, project)[0]
+
+
+def cmd_export_moments(args, settings: Settings) -> Path:
+    """Write the Claude prompt parts of an existing project again (no download, no transcription)."""
+    engine = _engine(settings)
+    project, _ = projects.get_project(engine, args.project_id)
+    return _print_export(engine, settings, project)[0]
+
+
+def cmd_import(args, settings: Settings) -> Path:
+    engine = _engine(settings)
+    try:
+        reply = Path(args.reply).read_text(encoding="utf-8")
+    except OSError as e:
+        raise AppError("INVALID_IMPORT", f"File balasan tidak bisa dibaca: {e}") from e
+    status = moments.import_part(engine, args.project_id, args.part, reply, settings)
+    if status["missing"]:
+        missing = ", ".join(map(str, status["missing"]))
+        print(f"Bagian {args.part} tersimpan. Masih menunggu balasan untuk bagian {missing}.")
+        return project_dir(settings, args.project_id)
+    moments.finish_moments(engine, args.project_id, settings=settings)
+    if args.queue_only:
+        print("Diantrekan; worker (scripts/dev.py) akan menyiapkan klip.")
+        return project_dir(settings, args.project_id)
+    project = _drain(engine, settings, args.project_id)
+    return _finish(engine, settings, project, render=not args.no_render)
+
+
+def cmd_analyze(args, settings: Settings) -> Path:
+    """Choose moments again with Ollama, reusing the project's transcript."""
+    settings = _with_models(settings, args)
+    engine = _engine(settings)
+    with session_scope(engine) as s:
+        project = fetch(s, Project, args.project_id, "Project")
+        if s.exec(select(Job).where(Job.project_id == project.id,
+                                    col(Job.status).in_(queue.ACTIVE_STATUSES))).first() is not None:
+            raise AppError("INVALID_STATE", "Project sedang diproses; tunggu sampai job selesai.")
+        done = project.last_completed_stage
+        if done is not None and STAGES.index(done) > STAGES.index("transcribe"):
+            project.last_completed_stage = "transcribe"
+        project.moment_source = "ollama"
+        project.status = "queued"
+        project.updated_at = utcnow()
+        s.add(project)
+        queue.enqueue(s, "process", project.id)
+    if args.queue_only:
+        print("Diantrekan; worker (scripts/dev.py) akan menganalisis ulang.")
+        return project_dir(settings, args.project_id)
+    project = _drain(engine, settings, args.project_id)
+    return _finish(engine, settings, project, render=not args.no_render)
+
+
+def _ingest(source: str, settings: Settings):
+    if _is_url(source):
         return ingest_youtube(source, settings)
     return ingest_file(Path(source), settings)
 
 
-MANUAL_RUN = "claude-manual"
-CLAUDE_PROMPT_FILE = "untuk_claude.md"
-
-
-class ImportFailed(Exception):
-    """The reply pasted back from Claude could not be used."""
-
-
-def prepare_project(src: Path, meta: VideoMeta, opts: RunOptions, settings: Settings,
-                    timer: _Timer) -> tuple[Transcript, list[tuple[float, float]], Path]:
-    """Audio, silences and transcript (all checkpointed). Returns transcript, silences, transcript dir."""
-    d = project_dir(settings, meta.project_id)
-    wav = d / "audio.wav"
-    timer.run("audio", extract_audio, src, wav)
-    silences = read_json(d / "silences.json")
-    if silences is None:
-        silences = timer.run("silences", detect_silences, wav)
-        atomic_write_json(d / "silences.json", silences)
-    tdir = d / "transcripts" / _safe(opts.whisper_model)
-    tdir.mkdir(parents=True, exist_ok=True)
-    corrections = load_corrections(Path(settings.data_dir) / "corrections.json")
-    t: Transcript = timer.run("transcribe", transcribe, wav, meta.duration, tdir,
-                              FasterWhisperTranscriber(opts.whisper_model), opts.whisper_model, corrections,
-                              on_progress=lambda p: print(f"  transkrip {p:.0%}", flush=True))
-    return t, [tuple(s) for s in silences], tdir
-
-
-def process_project(src: Path, meta: VideoMeta, opts: RunOptions, settings: Settings, timer: _Timer) -> Path:
-    t, silences, tdir = prepare_project(src, meta, opts, settings, timer)
-    llm = OllamaClient(settings.ollama_url, opts.llm_model)
-    # analysis checkpoints live next to the transcript they index into (sentence numbers differ per model)
-    picked = timer.run("analyze", analyze, t, meta, llm, opts.max_clips, opts.min_sec, opts.max_sec,
-                       tdir / "checkpoints")
-    return finish_clips(src, meta, t, silences, picked, opts, opts.llm_model, timer)
-
-
-def finish_clips(src: Path, meta: VideoMeta, t: Transcript, silences: list[tuple[float, float]],
-                 picked: list, opts: RunOptions, picker: str, timer: _Timer) -> Path:
-    """Snap edges, reframe, render and write the report for already-chosen clips."""
-    d = project_dir(get_settings(), meta.project_id)
-    run_dir = d / "runs" / f"{_safe(opts.whisper_model)}__{_safe(picker)}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    presets = load_presets()
-    by_time = sorted(picked, key=lambda p: p[0].start)
-    spans = [(c.start, c.end) for c, _ in by_time]
-    clips: list[ClipPlan] = []
-    t0 = time.monotonic()
-    for i, (cand, mats) in enumerate(by_time):
-        lower, upper = neighbor_bounds(spans, i, meta.duration)
-        s, e = snap_edges(cand.start, cand.end, t.words, t.sentences, silences, lower=lower, upper=upper,
-                          max_len=opts.max_sec + SNAP_SLACK)
-        cand = cand.model_copy(update={"start": s, "end": e})
-        segs, layout = reframe_clip(src, s, e)
-        clips.append(ClipPlan(id=uuid.uuid4().hex[:8], rank=0, candidate=cand, materials=mats,
-                              subtitles=group_lines(t.words, s, e), reframe_segments=segs, layout=layout))
-    clips.sort(key=lambda c: c.candidate.score, reverse=True)
-    for rank, c in enumerate(clips, 1):
-        c.rank = rank
-    for c in clips if opts.render else []:
-        print(f"  render klip {c.rank}/{len(clips)}", flush=True)
-        render_clip(src, c, run_dir / "clips" / clip_folder(c), presets, FONTS_DIR)
-    timer.timings["clips"] = round(time.monotonic() - t0, 1)
-
-    atomic_write_json(run_dir / "clips.json", [c.model_dump() for c in clips])
-    atomic_write_json(run_dir / "timings.json", timer.timings)
-    report = run_dir / "report.md"
-    if report.exists():  # never overwrite an evaluation the user may have filled in
-        report = run_dir / f"report-{time.strftime('%Y%m%d-%H%M%S')}.md"
-    report.write_text(build_report(meta, clips, timer.timings,
-                                   {"whisper": opts.whisper_model, "llm": picker}), encoding="utf-8")
-    return report
-
-
-def _load_project(project_id: str, settings: Settings) -> tuple[Path, VideoMeta]:
-    d = Path(settings.data_dir) / "projects" / project_id
-    meta = read_json(d / "meta.json")
-    if meta is None or not (d / "source.mp4").exists():
-        raise ImportFailed(f"Project {project_id} tidak ditemukan di {d}. Jalankan export-transcript dulu.")
-    return d / "source.mp4", VideoMeta.model_validate(meta)
-
-
-def cmd_export(args, settings: Settings) -> Path:
-    timer = _Timer()
-    src, meta = timer.run("ingest", _ingest, args.source, settings)
-    opts = _opts(args, settings)
-    t, _, tdir = prepare_project(src, meta, opts, settings, timer)
-    prompt = render_prompt("claude_manual", max_candidates=opts.max_clips, min_sec=opts.min_sec,
-                           max_sec=opts.max_sec, transcript=transcript_lines(t))
-    out = tdir / CLAUDE_PROMPT_FILE
-    out.write_text(prompt, encoding="utf-8")
-    print(f"Project ID: {meta.project_id}")
-    print("Berikan isi file ini ke Claude (Claude Code atau claude.ai), simpan balasannya sebagai .json, lalu:")
-    print(f"  uv run python -m app.cli import-moments {meta.project_id} <file-balasan.json>")
-    return out
-
-
-def cmd_import(args, settings: Settings) -> Path:
-    src, meta = _load_project(args.project_id, settings)
-    opts = _opts(args, settings)
-    timer = _Timer()
-    t, silences, _ = prepare_project(src, meta, opts, settings, timer)
-    raw = parse_llm_json(Path(args.reply).read_text(encoding="utf-8"))
-    try:
-        if raw is None:
-            raise ValueError("Balasan bukan JSON. Pastikan menyalin seluruh balasan Claude.")
-        picked = import_external(t, meta, raw, opts.max_clips, opts.min_sec, opts.max_sec)
-    except ValueError as e:
-        raise ImportFailed(str(e)) from e
-    return finish_clips(src, meta, t, silences, picked, opts, MANUAL_RUN, timer)
-
-
-def cmd_run(args, settings: Settings) -> Path:
-    timer = _Timer()
-    src, meta = timer.run("ingest", _ingest, args.source, settings)
-    return process_project(src, meta, _opts(args, settings), settings, timer)
-
-
-def cmd_analyze(args, settings: Settings) -> Path:
-    try:
-        src, meta = _load_project(args.project_id, settings)
-    except ImportFailed as e:
-        raise IngestError("INVALID_URL", str(e)) from e
-    return process_project(src, meta, _opts(args, settings), settings, _Timer())
-
-
 def cmd_bench_whisper(args, settings: Settings) -> Path:
+    """Compare Whisper models on the first seconds of a video (no database)."""
     src, meta = _ingest(args.source, settings)
     d = project_dir(settings, meta.project_id)
     wav = d / "audio.wav"
@@ -214,61 +305,84 @@ def cmd_bench_whisper(args, settings: Settings) -> Path:
     return path
 
 
-def _opts(args, settings: Settings) -> RunOptions:
-    return RunOptions(max_clips=args.max_clips, min_sec=args.min_sec, max_sec=args.max_sec,
-                      whisper_model=args.whisper_model or settings.whisper_model,
-                      llm_model=args.llm_model or settings.ollama_model, render=not args.no_render)
+def cmd_recover(args, settings: Settings) -> Path:
+    engine = _engine(settings)
+    with Session(engine) as s:
+        jobs, clips = recover_startup(s)
+    print(f"{jobs} job dan {clips} klip tertinggal dikembalikan ke antrean.")
+    return Path(settings.data_dir)
 
+
+def cmd_migrate(args, settings: Settings) -> Path:
+    result = migrate_m1.run(settings)
+    print(f"Migrasi M1: {result['projects']} project dan {result['clips']} klip baru, "
+          f"{result['skipped']} dilewati karena sudah ada.")
+    return Path(settings.data_dir)
+
+
+# ---------- entry point ----------
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="python -m app.cli", description="Kliplah: podcast ke klip vertikal")
+    p = argparse.ArgumentParser(prog="python -m app.cli", description="Kliplah: video panjang ke klip vertikal")
     sub = p.add_subparsers(dest="command", required=True)
 
-    def common(sp):
-        sp.add_argument("--max-clips", type=int, default=8)
-        sp.add_argument("--min-sec", type=int, default=30)
-        sp.add_argument("--max-sec", type=int, default=90)
-        sp.add_argument("--whisper-model", default=None)
-        sp.add_argument("--llm-model", default=None)
-        sp.add_argument("--no-render", action="store_true")
+    def jobs(sp):
+        sp.add_argument("--no-render", action="store_true", help="jangan setujui dan render klip otomatis")
+        sp.add_argument("--queue-only", action="store_true", help="hanya antrekan job, worker yang memproses")
 
-    run = sub.add_parser("run", help="link YouTube atau file video")
-    run.add_argument("source")
-    common(run)
-    an = sub.add_parser("analyze", help="analisis ulang project yang sudah ada")
+    def new_project(sp):
+        sp.add_argument("source", help="link YouTube atau file video")
+        sp.add_argument("--type", default=None, help="jenis konten (podcast, stream, variety, news, general)")
+        sp.add_argument("--max-clips", type=int, default=None)
+        sp.add_argument("--min-sec", type=int, default=None)
+        sp.add_argument("--max-sec", type=int, default=None)
+        sp.add_argument("--whisper-model", default=None)
+        jobs(sp)
+
+    run = sub.add_parser("run", help="proses link YouTube atau file video")
+    new_project(run)
+    run.add_argument("--moments", choices=sorted(MOMENT_SOURCES), default=None,
+                     help="pemilih momen (default: pengaturan aplikasi)")
+    run.add_argument("--llm-model", default=None, help=LLM_MODEL_HELP)
+    an = sub.add_parser("analyze", help="pilih momen ulang dengan Ollama memakai transkrip yang ada")
     an.add_argument("project_id")
-    common(an)
+    an.add_argument("--llm-model", default=None, help=LLM_MODEL_HELP)
+    jobs(an)
     ex = sub.add_parser("export-transcript", help="transkrip + instruksi untuk dipilihkan Claude (tanpa biaya API)")
-    ex.add_argument("source")
-    common(ex)
+    new_project(ex)
+    em = sub.add_parser("export-moments", help="tulis ulang file untuk Claude dari project yang sudah ada")
+    em.add_argument("project_id")
     im = sub.add_parser("import-moments", help="pakai balasan JSON dari Claude untuk membuat klip")
     im.add_argument("project_id")
     im.add_argument("reply", help="file berisi balasan Claude")
-    common(im)
+    im.add_argument("--part", type=int, default=1, help="nomor bagian transkrip (default 1)")
+    jobs(im)
     bw = sub.add_parser("bench-whisper", help="bandingkan model Whisper")
     bw.add_argument("source")
     bw.add_argument("--models", nargs="+", default=["small", "medium"])
     bw.add_argument("--seconds", type=float, default=300.0)
+    sub.add_parser("migrate-m1", help="pindahkan hasil CLI M1 ke database (sekali, aman diulang)")
+    sub.add_parser("recover", help="kembalikan job/klip yang tertinggal worker yang mati ke antrean; "
+                                   "HANYA saat tidak ada worker (scripts/dev.py) yang berjalan")
     return p
+
+
+HANDLERS = {"run": cmd_run, "analyze": cmd_analyze, "bench-whisper": cmd_bench_whisper,
+            "export-transcript": cmd_export, "import-moments": cmd_import, "export-moments": cmd_export_moments,
+            "migrate-m1": cmd_migrate, "recover": cmd_recover}
 
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = _parser().parse_args(argv)
-    settings = get_settings()
-    handler = {"run": cmd_run, "analyze": cmd_analyze, "bench-whisper": cmd_bench_whisper,
-               "export-transcript": cmd_export, "import-moments": cmd_import}[args.command]
     try:
-        out = handler(args, settings)
-    except ImportFailed as e:
-        print(f"[INVALID_IMPORT] {e}")
-        return 2
-    except IngestError as e:
+        out = HANDLERS[args.command](args, get_settings())
+    except AppError as e:
+        print(f"[{e.code}] {e.message}")
+        return 2 if e.code in USER_ERRORS else 1
+    except IngestError as e:  # bench-whisper calls ingest directly
         print(f"[{e.code}] {e}")
         return 1 if e.retryable else 2
-    except RenderError as e:
-        print(f"[{e.code}] {e}")
-        return 1
     print(f"Selesai: {out}")
     return 0
 
