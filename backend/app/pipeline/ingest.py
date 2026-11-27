@@ -68,9 +68,10 @@ def _map_download_error(err: Exception) -> IngestError:
     return IngestError("NETWORK", f"Gagal mengunduh: {msg[-200:]}", retryable=True)
 
 
-def ingest_youtube(url: str, settings: Settings) -> tuple[Path, VideoMeta]:
+def ingest_youtube(url: str, settings: Settings, project_id: str | None = None) -> tuple[Path, VideoMeta]:
+    """`project_id` names the project folder and `meta.project_id`; default is the YouTube video id."""
     vid = parse_youtube_id(url)
-    d = project_dir(settings, vid)
+    d = project_dir(settings, project_id or vid)
     src, meta_path = d / "source.mp4", d / "meta.json"
     cached = read_json(meta_path)
     if cached and src.exists():
@@ -96,6 +97,8 @@ def ingest_youtube(url: str, settings: Settings) -> tuple[Path, VideoMeta]:
     if not src.exists():
         raise IngestError("NETWORK", "Unduhan selesai tapi file video tidak ditemukan.", retryable=True)
     meta = meta_from_info(info)
+    if project_id:
+        meta = meta.model_copy(update={"project_id": project_id})
     atomic_write_json(meta_path, meta.model_dump())
     return src, meta
 
@@ -114,11 +117,12 @@ def _file_id(path: Path) -> str:
     return "file-" + h.hexdigest()[:12]
 
 
-def ingest_file(path: Path, settings: Settings) -> tuple[Path, VideoMeta]:
+def ingest_file(path: Path, settings: Settings, project_id: str | None = None) -> tuple[Path, VideoMeta]:
+    """`project_id` names the project folder and `meta.project_id`; default is a content hash of the file."""
     path = Path(path)
     if not path.is_file():
         raise IngestError("INVALID_URL", f"File tidak ditemukan: {path}")
-    pid = _file_id(path)
+    pid = project_id or _file_id(path)
     d = project_dir(settings, pid)
     src, meta_path = d / "source.mp4", d / "meta.json"
     cached = read_json(meta_path)

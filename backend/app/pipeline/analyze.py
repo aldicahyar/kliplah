@@ -192,9 +192,12 @@ def write_materials(c: Candidate, t: Transcript, llm: LLMClient) -> Materials:
     return _llm_materials(c, t, llm) or _default_materials(t, c)
 
 
-def transcript_lines(t: Transcript) -> str:
-    """The whole transcript as numbered lines: `[n] (mm:ss) text`."""
-    return "\n".join(f"[{s.i}] ({_mmss(s.start)}) {s.text}" for s in t.sentences)
+def transcript_lines(t: Transcript, start: int = 0, end: int | None = None) -> str:
+    """Numbered lines `[n] (mm:ss) text` for sentences `start` up to (not including) `end`; default all.
+
+    Numbers stay global, so a slice keeps the sentence numbers of the whole transcript.
+    """
+    return "\n".join(f"[{s.i}] ({_mmss(s.start)}) {s.text}" for s in t.sentences[start:end])
 
 
 def import_external(t: Transcript, meta: VideoMeta, raw: dict | list, max_clips: int, min_sec: int,

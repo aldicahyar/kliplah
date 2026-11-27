@@ -1,0 +1,47 @@
+{
+  "podcast": {
+    "key": "podcast",
+    "label": "Podcast",
+    "min_sec": 30,
+    "max_sec": 90,
+    "default_layouts": ["face_crop", "fit_blur"],
+    "criteria": ["opini tajam", "pengungkapan", "cerita"],
+    "signals": ["heatmap"]
+  },
+  "stream": {
+    "key": "stream",
+    "label": "Live stream",
+    "min_sec": 15,
+    "max_sec": 35,
+    "default_layouts": ["facecam_gameplay", "facecam_full"],
+    "criteria": ["reaksi", "kaget", "tawa", "gagal atau berhasil di game", "interaksi chat"],
+    "signals": ["live_chat", "audio_peak"]
+  },
+  "variety": {
+    "key": "variety",
+    "label": "Variety show",
+    "min_sec": 15,
+    "max_sec": 35,
+    "default_layouts": ["fit_blur", "fit_solid"],
+    "criteria": ["lucu", "canggung", "reaksi member", "interaksi"],
+    "signals": ["audio_peak", "live_chat"]
+  },
+  "news": {
+    "key": "news",
+    "label": "Berita",
+    "min_sec": 30,
+    "max_sec": 60,
+    "default_layouts": ["fit_blur"],
+    "criteria": ["fakta mengejutkan", "pengungkapan", "perbandingan"],
+    "signals": ["heatmap"]
+  },
+  "general": {
+    "key": "general",
+    "label": "Umum",
+    "min_sec": 20,
+    "max_sec": 60,
+    "default_layouts": ["fit_blur"],
+    "criteria": ["opini tajam", "pengungkapan", "cerita", "momen emosional", "nilai praktis"],
+    "signals": ["heatmap"]
+  }
+}
