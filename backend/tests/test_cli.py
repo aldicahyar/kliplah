@@ -14,6 +14,7 @@ from app.db.tables import Clip, Job, Project
 from app.pipeline.analyze import analyze
 from app.pipeline.ingest import IngestError
 from app.pipeline.transcribe import transcribe
+from app.providers.llm import LLMUnavailable
 from app.services import settings_store
 from app.worker import main as worker_main_mod
 from app.worker import queue
@@ -28,8 +29,10 @@ URL = "https://youtu.be/vid12345678"
 class FakeTranscriber:
     calls = 0
 
-    def __init__(self, model_name):
+    def __init__(self, model_name, language=None, target_language="id"):
         self.model_name = model_name
+        self.language = language
+        self.target_language = target_language
 
     def transcribe_chunk(self, wav, start, end):
         FakeTranscriber.calls += 1
@@ -74,19 +77,38 @@ class Pipeline:
         return d / "source.mp4", VideoMeta(source_type=project.source_type, project_id=project.id, title="Judul",
                                            duration=240.0, video_id="vid12345678")
 
-    def transcribe(self, wav, duration, tdir, model, corrections, on_progress=None):
+    def transcribe(self, wav, duration, tdir, model, corrections, on_progress=None,
+                   language=None, target_language="id"):
         self.transcribed.append((model, tdir))
-        return transcribe(wav, duration, tdir, FakeTranscriber(model), model, corrections, on_progress=on_progress)
+        return transcribe(
+            wav,
+            duration,
+            tdir,
+            FakeTranscriber(model, language=language, target_language=target_language),
+            model,
+            corrections,
+            on_progress=on_progress,
+            language=language,
+        )
 
     def analyze(self, t, meta, max_clips, min_sec, max_sec, checkpoint_dir, settings):
         self.llm_models.append(settings.ollama_model)
         llm = FakeOllama(settings.ollama_url, settings.ollama_model)
         return analyze(t, meta, llm, max_clips, min_sec, max_sec, checkpoint_dir)
 
+    def translate(self, sentences, source, target, checkpoint_dir, settings, on_progress=None):
+        if on_progress is not None:
+            on_progress(1.0)
+        return {s.i: f"terjemahan {s.text}" for s in sentences}, []
+
+    def translate_prepare(self, sentences, source, target, checkpoint_dir, settings, on_progress=None):
+        raise LLMUnavailable("mocked offline")
+
     def prepare(self, engine, project_id, picks):
         deps = PrepareDeps(settings=self.settings, thumbnail=lambda src, t, out: None, proxy=lambda src, out: None,
                            reframe=lambda v, a, b: ([ReframeSegment(start=0, end=b - a, mode="track", x=0.3)],
-                                                    "face_crop"))
+                                                    "face_crop"),
+                           translate=self.translate_prepare)
         build_clips_from_picks(engine, project_id, picks, deps)
 
     def render(self, source, plan, out_dir, presets, fonts_dir, on_progress=None):
@@ -97,8 +119,8 @@ class Pipeline:
 
     def deps(self, settings: Settings) -> ProcessDeps:
         return ProcessDeps(settings=settings, ingest=self.ingest, extract_audio=lambda a, b: b.write_bytes(b"w"),
-                           detect_silences=lambda wav: [], transcribe=self.transcribe, analyze=self.analyze,
-                           prepare=self.prepare)
+                           detect_silences=lambda wav: [], transcribe=self.transcribe, translate=self.translate,
+                           analyze=self.analyze, prepare=self.prepare)
 
 
 @pytest.fixture
@@ -533,14 +555,14 @@ def test_cli_probe_prints_estimate(env, monkeypatch, capsys):
     ))
     assert cli.main(["probe", URL, "--range", "00:30:00-01:00:00"]) == 0
     out = capsys.readouterr().out
-    assert "Stream Panjang" in out and "26" in out
+    assert "Stream Panjang" in out and "37" in out
     low = out.lower()
-    for word in ("unduh", "encode", "transkrip", "chat", "llm"):
+    for word in ("unduh", "encode", "transkrip", "chat", "terjemah", "llm"):
         assert word in low
 
     assert cli.main(["probe", URL, "--range", "05:20:00-05:50:00", "--type", "stream", "--moments", "ollama"]) == 0
     out2 = capsys.readouterr().out
-    assert "107" in out2 or "106" in out2 or "108" in out2 or "110" in out2
+    assert "93" in out2
 
 
 def test_cli_age_restricted_exit_code_2(env, capsys):
@@ -548,3 +570,103 @@ def test_cli_age_restricted_exit_code_2(env, capsys):
     pipe.ingest_error = IngestError("AGE_RESTRICTED", "Video ini dibatasi umur.")
     assert cli.main(["run", URL, "--moments", "ollama"]) == 2
     assert "[AGE_RESTRICTED]" in capsys.readouterr().out
+
+
+def test_cli_run_with_source_language(env, capsys):
+    from app.core.models import Transcript
+
+    settings, _ = env
+    assert cli.main(["run", URL, "--source-language", "KO", "--target-language", "id", "--moments", "claude"]) == 0
+    [p] = _projects(settings)
+    assert p.source_language == "ko" and p.target_language == "id"
+    tdir = Path(settings.data_dir) / "projects" / p.id / "transcripts" / "small"
+    t = Transcript.model_validate_json((tdir / "transcript.json").read_text(encoding="utf-8"))
+    assert t.language == "ko"
+    prompt = (tdir / "untuk_claude.md").read_text(encoding="utf-8")
+    assert "Korea" in prompt and '"lines"' in prompt
+
+    assert cli.main(["export-transcript", URL, "--source-language", "en", "--target-language", "id", "--queue-only"]) == 0
+    [_, queued_p] = _projects(settings)
+    assert queued_p.source_language == "en" and queued_p.target_language == "id"
+
+    assert cli.main(["run", URL, "--source-language", "xx", "--queue-only"]) == 2
+    assert "[VALIDATION]" in capsys.readouterr().out
+
+
+def test_cli_probe_type_option(env, monkeypatch, capsys):
+    from app.services import projects
+
+    monkeypatch.setattr(
+        projects,
+        "probe_youtube",
+        lambda url, s, cookies_browser="": VideoMeta(
+            source_type="youtube",
+            project_id="vid12345678",
+            title="Stream Korea",
+            channel="Ch",
+            duration=31380.0,
+            video_id="vid12345678",
+            subtitles={"manual": [], "auto": ["ko"]},
+            has_live_chat=True,
+            language="ko",
+        ),
+    )
+    assert cli.main([
+        "probe", URL, "--range", "05:20:00-05:50:00", "--type", "stream",
+        "--source-language", "ko", "--moments", "ollama",
+    ]) == 0
+    out_stream = capsys.readouterr().out
+    assert "Stream Korea" in out_stream
+    assert "chat 5m" in out_stream
+    assert "terjemah 10m" in out_stream
+    assert "Peringatan:" in out_stream and "Claude" in out_stream and "medium" in out_stream
+
+    assert cli.main([
+        "probe", URL, "--range", "05:20:00-05:50:00", "--type", "podcast",
+        "--source-language", "ko", "--moments", "claude",
+    ]) == 0
+    out_podcast = capsys.readouterr().out
+    assert "chat 0m" in out_podcast and "terjemah 0m" in out_podcast
+
+
+def test_cli_export_and_import_translation(env, tmp_path, capsys):
+    settings, _ = env
+    assert cli.main(["export-transcript", URL, "--source-language", "en"]) == 0
+    [project] = _projects(settings)
+    moments_reply = _claude_reply(tmp_path, json.dumps({"clips": [_clip_row()]}))
+    assert cli.main(["import-moments", project.id, str(moments_reply), "--no-render"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["export-translation", project.id, "--scope", "clips"]) == 0
+    out = capsys.readouterr().out
+    export_file = (
+        Path(settings.data_dir)
+        / "projects"
+        / project.id
+        / "transcripts"
+        / "small"
+        / "translation_export"
+        / "terjemahan_claude.md"
+    )
+    assert export_file.is_file()
+    assert str(export_file) in out
+    assert f"import-translation {project.id}" in out
+
+    assert cli.main(["import-translation", project.id, str(tmp_path / "hilang.json")]) == 2
+    assert "[INVALID_IMPORT]" in capsys.readouterr().out
+
+    bad_reply = tmp_path / "bad_tr.json"
+    bad_reply.write_text("bukan json", encoding="utf-8")
+    assert cli.main(["import-translation", project.id, str(bad_reply)]) == 2
+    assert "[INVALID_IMPORT]" in capsys.readouterr().out
+
+    lines = [{"n": i, "text": f"terjemahan kalimat {i}"} for i in range(10)]
+    good_reply = tmp_path / "good_tr.json"
+    good_reply.write_text("```json\n" + json.dumps({"lines": lines}) + "\n```", encoding="utf-8")
+    assert cli.main(["import-translation", project.id, str(good_reply), "--part", "1"]) == 0
+    imp_out = capsys.readouterr().out
+    assert "10" in imp_out
+
+    [clip] = _clips(settings, project.id)
+    assert all(line["source"] == "translated" for line in clip.subtitles)
+    assert any("terjemahan kalimat 0" in line["text"] for line in clip.subtitles)

@@ -10,13 +10,14 @@ from sqlalchemy import Engine
 from sqlmodel import Session, col, select
 
 from app.core.config import Settings, get_settings
+from app.core.errors import AppError
 from app.db.engine import session_scope
 from app.db.tables import Clip, Job, Project, StyleTemplate, utcnow
-from app.domain.languages import normalize_language
+from app.domain.languages import is_weak_local_translation, language_name, normalize_language
 from app.domain.profiles import profile_for
 from app.domain.ranges import normalize_ranges
 from app.pipeline.ingest import IngestError, parse_youtube_id, probe_youtube
-from app.pipeline.youtube_subs import TRANSCRIPT_SOURCES, resolve_transcript_source
+from app.pipeline.youtube_subs import TRANSCRIPT_SOURCES, resolve_subtitle_plan
 from app.services import styles
 from app.services._common import domain_errors, err, fetch
 from app.services.settings_store import MOMENT_SOURCES, get_app_settings
@@ -27,11 +28,12 @@ FACECAM_LAYOUTS = ("facecam_gameplay", "facecam_full")
 # perkiraan dari uji nyata 2026-11-27 (i7-1355U, tanpa GPU)
 DOWNLOAD_SEC_PER_HOUR = 120.0
 ENCODE_FACTOR = 0.35
-WHISPER_FACTOR = 0.5
-CHAT_SEC_PER_HOUR = 300.0
+WHISPER_FACTOR = 0.85
+CHAT_SEC_PER_HOUR = 50.0
 LLM_SEC_PER_WINDOW = 480.0
 LLM_WINDOW_SEC = 300.0
 LLM_SEC_PER_CLIP = 25.0
+TRANSLATE_SEC_PER_MIN = 20.0  # perkiraan awal, dikalibrasi di Task 12
 
 
 def _breakdown_minutes(secs: dict[str, float]) -> tuple[int, dict[str, int]]:
@@ -69,11 +71,56 @@ def _upload_filename(upload_path: Path, original_filename: str | None) -> str:
     return name
 
 
-def probe(engine: Engine, url: str, *, ranges: list | None = None, target_language: str = "id",
-          content_type: str | None = None, moment_source: str | None = None, max_clips: int | None = None,
-          settings: Settings | None = None) -> dict:
+def _normalize_source(source_language: Any) -> str | None:
+    with domain_errors("source_language"):
+        if source_language is not None and not isinstance(source_language, str):
+            raise err("VALIDATION", "Bahasa sumber harus berupa teks.")
+        return normalize_language(source_language)
+
+
+def _normalize_target(target_language: Any) -> str:
+    with domain_errors("target_language"):
+        if target_language is not None and not isinstance(target_language, str):
+            raise err("VALIDATION", "Bahasa target harus berupa teks.")
+        return normalize_language(target_language) or "id"
+
+
+def _safe_norm(code: str | None) -> str | None:
+    if code is None:
+        return None
+    try:
+        return normalize_language(code)
+    except AppError:
+        cleaned = code.strip().lower()
+        return cleaned or None
+
+
+def _probe_warnings(effective_dur: float, plan, cand_lang: str | None, needs_tr: bool,
+                    resolved_moment: str) -> list[str]:
+    warnings: list[str] = []
+    if effective_dur > 7200:
+        warnings.append("Durasi video lebih dari 2 jam; pilih rentang waktu atau sumber transkrip youtube_auto "
+                        "agar proses lebih cepat dan hemat ruang disk.")
+    if needs_tr and cand_lang is not None and is_weak_local_translation(cand_lang) and resolved_moment == "ollama":
+        warnings.append(
+            f"Bahasa sumber {language_name(cand_lang, 'id')} kurang akurat diterjemahkan dengan Ollama lokal; "
+            "pertimbangkan jalur Claude manual."
+        )
+    if plan.source == "whisper" and cand_lang is not None and cand_lang not in ("id", "en"):
+        warnings.append(
+            f"Bahasa sumber {language_name(cand_lang, 'id')} bukan Indonesia/Inggris; "
+            "pertimbangkan whisper_model 'medium' agar transkrip lebih akurat."
+        )
+    return warnings
+
+
+def probe(engine: Engine, url: str, *, ranges: list | None = None, source_language: str | None = None,
+          target_language: str = "id", content_type: str | None = None, moment_source: str | None = None,
+          max_clips: int | None = None, settings: Settings | None = None) -> dict:
     """Inspect a YouTube link without downloading: metadata, subtitle/chat flags, resource estimates, warnings."""
     settings = settings or get_settings()
+    norm_source = _normalize_source(source_language)
+    norm_target = _normalize_target(target_language)
     with session_scope(engine) as s:
         app = get_app_settings(s, settings=settings)
     cookies_browser = app["cookies_browser"]
@@ -90,17 +137,28 @@ def probe(engine: Engine, url: str, *, ranges: list | None = None, target_langua
         raise err(e.code, str(e)) from e
     norm = normalize_ranges(ranges, meta.duration or None)
     effective_dur = sum(e - s for s, e in norm) if norm else meta.duration
-    auto_source = resolve_transcript_source("auto", meta, target_language)
+    plan = resolve_subtitle_plan("auto", meta, norm_target, source_language=norm_source)
+    cand_lang = _safe_norm(plan.language) or norm_source or _safe_norm(meta.language)
+    needs_tr = (
+        plan.needs_translation
+        if plan.needs_translation is not None
+        else (cand_lang is not None and cand_lang != norm_target)
+    )
     video_rate = 0.6 * 1024**2 if norm else 1.5 * 1024**2
     disk_bytes = effective_dur * (video_rate + 32 * 1024)
     disk_gb = round(disk_bytes / 1024**3, 1)
     download_sec = (effective_dur / 3600.0) * DOWNLOAD_SEC_PER_HOUR
     encode_sec = effective_dur * ENCODE_FACTOR if norm else 0.0
-    whisper_sec = effective_dur * WHISPER_FACTOR if auto_source == "whisper" else 0.0
+    whisper_sec = effective_dur * WHISPER_FACTOR if plan.source == "whisper" else 0.0
     chat_dur = norm[-1][1] if norm else meta.duration
     chat_sec = (
         (chat_dur / 3600.0) * CHAT_SEC_PER_HOUR
         if meta.has_live_chat and "live_chat" in profile.signals
+        else 0.0
+    )
+    translate_sec = (
+        (effective_dur / 60.0) * TRANSLATE_SEC_PER_MIN
+        if effective_dur > 0 and needs_tr and resolved_moment == "ollama"
         else 0.0
     )
     llm_sec = (
@@ -113,15 +171,13 @@ def probe(engine: Engine, url: str, *, ranges: list | None = None, target_langua
         "encode_min": encode_sec,
         "transcribe_min": whisper_sec,
         "chat_min": chat_sec,
+        "translate_min": translate_sec,
         "llm_min": llm_sec,
     })
     if effective_dur <= 0:
         process_minutes = 0
         breakdown = {k: 0 for k in breakdown}
-    warnings: list[str] = []
-    if effective_dur > 7200:
-        warnings.append("Durasi video lebih dari 2 jam; pilih rentang waktu atau sumber transkrip youtube_auto "
-                        "agar proses lebih cepat dan hemat ruang disk.")
+    warnings = _probe_warnings(effective_dur, plan, cand_lang, needs_tr, resolved_moment)
     return {
         "title": meta.title,
         "channel": meta.channel,
@@ -130,7 +186,14 @@ def probe(engine: Engine, url: str, *, ranges: list | None = None, target_langua
         "has_heatmap": bool(meta.heatmap),
         "subtitles": meta.subtitles or {"manual": [], "auto": []},
         "has_live_chat": meta.has_live_chat,
-        "transcript_source_auto": auto_source,
+        "transcript_source_auto": plan.source,
+        "source_language_hint": meta.language,
+        "subtitle_plan": {
+            "source": plan.source,
+            "language": plan.language,
+            "needs_translation": plan.needs_translation,
+        },
+        "translation_engine": "ollama" if resolved_moment == "ollama" else "claude",
         "estimate": {"process_minutes": process_minutes, "breakdown": breakdown, "disk_gb": disk_gb},
         "warnings": warnings,
     }
@@ -161,10 +224,8 @@ def create_project(engine: Engine, *, url: str | None = None, upload_path: Path 
 
     if content_type is not None:
         _content_profile(content_type)
-    with domain_errors("source_language"):
-        if source_language is not None and not isinstance(source_language, str):
-            raise err("VALIDATION", "Bahasa sumber harus berupa teks.")
-        norm_source = normalize_language(source_language)
+    norm_source = _normalize_source(source_language)
+    norm_target = _normalize_target(target_language)
     if min_clip_sec is not None:
         _check_positive_int("min_clip_sec", min_clip_sec)
     if max_clip_sec is not None:
@@ -200,7 +261,7 @@ def create_project(engine: Engine, *, url: str | None = None, upload_path: Path 
             id=project_id, source_type="youtube" if url is not None else "upload",
             youtube_url=url.strip() if url is not None else None, video_id=video_id, original_filename=filename,
             content_type=resolved_type, ranges=stored_ranges, focus_prompt=focus_prompt,
-            source_language=norm_source, target_language=target_language, transcript_source=transcript_source,
+            source_language=norm_source, target_language=norm_target, transcript_source=transcript_source,
             moment_source=moment_source or app["moment_source"],
             max_clips=max_clips if max_clips is not None else app["max_clips"],
             min_clip_sec=min_sec, max_clip_sec=max_sec, style=copy.deepcopy(template.style),

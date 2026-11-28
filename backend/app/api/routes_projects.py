@@ -3,7 +3,7 @@ import json
 import shutil
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from pydantic import BaseModel
@@ -13,7 +13,7 @@ from app.api.deps import dump, file_or_404, get_engine_dep, get_settings_dep
 from app.core.config import Settings
 from app.core.errors import AppError
 from app.core.fs import read_json
-from app.services import clips, moments, projects
+from app.services import clips, moments, projects, translation
 from app.worker.process import transcript_dir
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -23,6 +23,7 @@ class ProjectOptions(BaseModel):
     content_type: str | None = None
     ranges: list | None = None
     focus_prompt: str | None = None
+    source_language: str | None = None
     target_language: str = "id"
     transcript_source: str = "auto"
     moment_source: str | None = None
@@ -39,6 +40,8 @@ class ProjectCreate(ProjectOptions):
 class ProbeRequest(BaseModel):
     url: str
     ranges: list | None = None
+    source_language: str | None = None
+    target_language: str = "id"
     content_type: str | None = None
     moment_source: str | None = None
     max_clips: int | None = None
@@ -61,6 +64,8 @@ def probe_project(body: ProbeRequest, engine: Engine = Depends(get_engine_dep),
         engine,
         body.url,
         ranges=body.ranges,
+        source_language=body.source_language,
+        target_language=body.target_language,
         content_type=body.content_type,
         moment_source=body.moment_source,
         max_clips=body.max_clips,
@@ -90,16 +95,17 @@ def _parse_ranges(raw: str | None) -> list | None:
 @router.post("/upload", status_code=201)
 def upload_project(file: UploadFile = File(...), content_type: str | None = Form(None),
                    ranges: str | None = Form(None), focus_prompt: str | None = Form(None),
-                   target_language: str = Form("id"), transcript_source: str = Form("auto"),
-                   moment_source: str | None = Form(None), max_clips: int | None = Form(None),
-                   min_clip_sec: int | None = Form(None), max_clip_sec: int | None = Form(None),
-                   style_template_id: str | None = Form(None), engine: Engine = Depends(get_engine_dep),
-                   settings: Settings = Depends(get_settings_dep)) -> dict:
+                   source_language: str | None = Form(None), target_language: str = Form("id"),
+                   transcript_source: str = Form("auto"), moment_source: str | None = Form(None),
+                   max_clips: int | None = Form(None), min_clip_sec: int | None = Form(None),
+                   max_clip_sec: int | None = Form(None), style_template_id: str | None = Form(None),
+                   engine: Engine = Depends(get_engine_dep), settings: Settings = Depends(get_settings_dep)) -> dict:
     """Stream the file to `uploads/_incoming/`; `create_project` moves it into `uploads/<id>/`."""
     options = ProjectOptions(content_type=content_type, ranges=_parse_ranges(ranges), focus_prompt=focus_prompt,
-                             target_language=target_language, transcript_source=transcript_source,
-                             moment_source=moment_source, max_clips=max_clips, min_clip_sec=min_clip_sec,
-                             max_clip_sec=max_clip_sec, style_template_id=style_template_id)
+                             source_language=source_language, target_language=target_language,
+                             transcript_source=transcript_source, moment_source=moment_source,
+                             max_clips=max_clips, min_clip_sec=min_clip_sec, max_clip_sec=max_clip_sec,
+                             style_template_id=style_template_id)
     incoming = Path(settings.data_dir) / "uploads" / "_incoming"
     incoming.mkdir(parents=True, exist_ok=True)
     tmp = incoming / uuid.uuid4().hex
@@ -147,6 +153,13 @@ def delete_project(project_id: str, engine: Engine = Depends(get_engine_dep),
     return Response(status_code=204)
 
 
+async def _read_utf8_body(request: Request) -> str:
+    try:
+        return (await request.body()).decode("utf-8")
+    except UnicodeDecodeError:
+        raise AppError("VALIDATION", "Balasan harus berupa teks UTF-8.", status=422) from None
+
+
 # ---------- Claude-manual moments ----------
 
 @router.get("/{project_id}/moments-export")
@@ -160,17 +173,30 @@ async def moments_import(project_id: str, request: Request, part: int = Query(1)
                          engine: Engine = Depends(get_engine_dep),
                          settings: Settings = Depends(get_settings_dep)) -> dict:
     """The body is Claude's reply as-is (plain text or JSON), decoded as UTF-8."""
-    try:
-        text = (await request.body()).decode("utf-8")
-    except UnicodeDecodeError:
-        raise AppError("VALIDATION", "Balasan harus berupa teks UTF-8.", status=422) from None
-    return moments.import_part(engine, project_id, part, text, settings=settings)
+    return moments.import_part(engine, project_id, part, await _read_utf8_body(request), settings=settings)
 
 
 @router.post("/{project_id}/moments-finish")
 def moments_finish(project_id: str, allow_missing: bool = Query(False), engine: Engine = Depends(get_engine_dep),
                    settings: Settings = Depends(get_settings_dep)) -> dict:
     return dump(moments.finish_moments(engine, project_id, allow_missing=allow_missing, settings=settings))
+
+
+# ---------- Claude-manual translation ----------
+
+@router.get("/{project_id}/translation-export")
+def translation_export(project_id: str, scope: Literal["clips", "all"] = Query("clips"),
+                       engine: Engine = Depends(get_engine_dep),
+                       settings: Settings = Depends(get_settings_dep)) -> list[dict]:
+    return translation.export_translation(engine, project_id, scope=scope, settings=settings)
+
+
+@router.post("/{project_id}/translation-import")
+async def translation_import(project_id: str, request: Request, part: int = Query(1),
+                             engine: Engine = Depends(get_engine_dep),
+                             settings: Settings = Depends(get_settings_dep)) -> dict:
+    """The body is Claude's reply as-is (plain text or JSON), decoded as UTF-8."""
+    return translation.import_translation(engine, project_id, part, await _read_utf8_body(request), settings=settings)
 
 
 # ---------- files ----------

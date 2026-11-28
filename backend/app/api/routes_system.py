@@ -10,6 +10,7 @@ from sqlalchemy import Engine, text
 from app.api.deps import get_engine_dep, get_settings_dep
 from app.core.config import REPO_DIR, Settings
 from app.db.engine import session_scope
+from app.domain.languages import LOW_CONFIDENCE_PROB, load_languages
 from app.domain.profiles import load_profiles
 from app.services.settings_store import get_app_settings, put_app_settings
 from scripts import check_setup
@@ -78,6 +79,17 @@ def style_schema() -> dict:
 @router.get("/profiles")
 def profiles() -> dict:
     return {key: p.model_dump() for key, p in load_profiles().items()}
+
+
+@router.get("/languages")
+def languages() -> dict:
+    return {
+        "languages": [
+            {"code": code, "name_id": lang.name_id, "name_en": lang.name_en, "whisper": lang.whisper}
+            for code, lang in load_languages().items()
+        ],
+        "low_confidence_prob": LOW_CONFIDENCE_PROB,
+    }
 
 
 @router.get("/settings")

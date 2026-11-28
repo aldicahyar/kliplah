@@ -40,7 +40,7 @@ from app.pipeline.ingest import IngestError, ingest_file, ingest_youtube
 from app.pipeline.youtube_subs import TRANSCRIPT_SOURCES
 from app.providers.transcriber import FasterWhisperTranscriber
 from app.services import clips as clip_service
-from app.services import moments, projects
+from app.services import moments, projects, translation
 from app.services._common import fetch
 from app.services.settings_store import get_app_settings, put_app_settings
 from app.worker import queue
@@ -209,11 +209,19 @@ def _parse_ranges(raw: list[str] | None) -> list[list[float]] | None:
     return [[s, e] for s, e in (parse_range(r) for r in raw)]
 
 
+def _read_reply_file(path: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        raise AppError("INVALID_IMPORT", f"File balasan tidak bisa dibaca: {e}") from e
+
+
 def cmd_run(args, settings: Settings) -> Path:
     settings = _with_models(settings, args)
     engine = _engine(settings)
     project = _create(engine, settings, args.source, content_type=args.type,
                       ranges=_parse_ranges(args.range), focus_prompt=args.focus,
+                      source_language=args.source_language, target_language=args.target_language,
                       transcript_source=args.transcript_source,
                       moment_source=MOMENT_SOURCES[args.moments] if args.moments else None,
                       max_clips=args.max_clips, min_clip_sec=args.min_sec, max_clip_sec=args.max_sec)
@@ -229,6 +237,7 @@ def cmd_export(args, settings: Settings) -> Path:
     engine = _engine(settings)
     project = _create(engine, settings, args.source, content_type=args.type,
                       ranges=_parse_ranges(args.range), focus_prompt=args.focus,
+                      source_language=args.source_language, target_language=args.target_language,
                       transcript_source=args.transcript_source,
                       moment_source="claude_manual", max_clips=args.max_clips, min_clip_sec=args.min_sec,
                       max_clip_sec=args.max_sec)
@@ -251,10 +260,7 @@ def cmd_export_moments(args, settings: Settings) -> Path:
 
 def cmd_import(args, settings: Settings) -> Path:
     engine = _engine(settings)
-    try:
-        reply = Path(args.reply).read_text(encoding="utf-8")
-    except OSError as e:
-        raise AppError("INVALID_IMPORT", f"File balasan tidak bisa dibaca: {e}") from e
+    reply = _read_reply_file(args.reply)
     status = moments.import_part(engine, args.project_id, args.part, reply, settings)
     if status["missing"]:
         missing = ", ".join(map(str, status["missing"]))
@@ -266,6 +272,39 @@ def cmd_import(args, settings: Settings) -> Path:
         return project_dir(settings, args.project_id)
     project = _drain(engine, settings, args.project_id)
     return _finish(engine, settings, project, render=not args.no_render)
+
+
+def cmd_export_translation(args, settings: Settings) -> Path:
+    """Export untranslated sentences of a project for Claude manual translation."""
+    engine = _engine(settings)
+    project, _ = projects.get_project(engine, args.project_id)
+    parts = translation.export_translation(engine, project.id, scope=args.scope, settings=settings)
+    export_dir = transcript_dir(settings, project) / "translation_export"
+    print(f"Project ID: {project.id}")
+    if not parts:
+        print("Semua kalimat pada cakupan ini sudah diterjemahkan.")
+        return export_dir
+    paths = [export_dir / p["filename"] for p in parts]
+    print("Berikan isi file berikut ke Claude (Claude Code atau claude.ai), satu per satu:")
+    for p in paths:
+        print(f"  {p}")
+    print("Simpan setiap balasan sebagai .json, lalu:")
+    for p in parts:
+        part = f" --part {p['part']}" if p["of"] > 1 else ""
+        print(f"  uv run python -m app.cli import-translation {project.id} <file-balasan.json>{part}")
+    return export_dir
+
+
+def cmd_import_translation(args, settings: Settings) -> Path:
+    """Import one manual translation reply part from Claude and refresh unedited clip subtitles."""
+    engine = _engine(settings)
+    reply = _read_reply_file(args.reply)
+    res = translation.import_translation(engine, args.project_id, args.part, reply, settings=settings)
+    print(
+        f"Terjemahan tersimpan: {res['merged']} kalimat digabung, "
+        f"{len(res['refreshed'])} klip diperbarui, {len(res['skipped'])} klip dilewati."
+    )
+    return project_dir(settings, args.project_id)
 
 
 def cmd_analyze(args, settings: Settings) -> Path:
@@ -339,6 +378,8 @@ def cmd_probe(args, settings: Settings) -> Path:
         engine,
         args.url,
         ranges=_parse_ranges(args.range),
+        source_language=args.source_language,
+        target_language=args.target_language,
         content_type=args.type,
         moment_source=MOMENT_SOURCES[args.moments] if args.moments else None,
         max_clips=args.max_clips,
@@ -350,12 +391,15 @@ def cmd_probe(args, settings: Settings) -> Path:
           f"Live chat: {'ya' if info['has_live_chat'] else 'tidak'}")
     print(f"Subtitle manual: {', '.join(subs.get('manual') or []) or '-'} | "
           f"auto: {', '.join(subs.get('auto') or []) or '-'}")
-    print(f"Sumber transkrip otomatis: {info['transcript_source_auto']}")
+    plan = info["subtitle_plan"]
+    print(f"Sumber transkrip otomatis: {info['transcript_source_auto']} "
+          f"(bahasa: {plan['language'] or 'deteksi'}, hint: {info['source_language_hint'] or '-'}, "
+          f"terjemahan: {info['translation_engine']})")
     est = info["estimate"]
     b = est["breakdown"]
     print(f"Perkiraan: ~{est['process_minutes']} menit proses "
           f"(unduh {b['download_min']}m, encode {b['encode_min']}m, transkrip {b['transcribe_min']}m, "
-          f"chat {b['chat_min']}m, LLM {b['llm_min']}m), ~{est['disk_gb']} GB disk")
+          f"chat {b['chat_min']}m, terjemah {b['translate_min']}m, LLM {b['llm_min']}m), ~{est['disk_gb']} GB disk")
     for w in info["warnings"]:
         print(f"Peringatan: {w}")
     return Path(settings.data_dir)
@@ -404,6 +448,10 @@ def _parser() -> argparse.ArgumentParser:
         sp.add_argument("--range", action="append", default=None, metavar="HH:MM:SS-HH:MM:SS",
                         help="rentang waktu yang diproses (boleh diulang)")
         sp.add_argument("--focus", default=None, help="arahan momen yang dicari")
+        sp.add_argument("--source-language", default=None, metavar="KODE",
+                        help="kode bahasa video sumber (kosong/auto = deteksi otomatis)")
+        sp.add_argument("--target-language", default="id", metavar="KODE",
+                        help="kode bahasa target hasil subtitle (default: id)")
         sp.add_argument("--transcript-source", choices=TRANSCRIPT_SOURCES, default="auto",
                         help="sumber transkrip (auto, youtube_manual, youtube_auto, whisper)")
         sp.add_argument("--max-clips", type=int, default=None)
@@ -430,11 +478,24 @@ def _parser() -> argparse.ArgumentParser:
     im.add_argument("reply", help="file berisi balasan Claude")
     im.add_argument("--part", type=int, default=1, help="nomor bagian transkrip (default 1)")
     jobs(im)
+    et = sub.add_parser("export-translation",
+                        help="ekspor kalimat belum diterjemahkan untuk Claude (tanpa biaya API)")
+    et.add_argument("project_id")
+    et.add_argument("--scope", choices=("clips", "all"), default="clips",
+                    help="cakupan kalimat yang diekspor (default: clips)")
+    it = sub.add_parser("import-translation",
+                        help="pakai balasan JSON terjemahan dari Claude untuk subtitle klip")
+    it.add_argument("project_id")
+    it.add_argument("reply", help="file berisi balasan terjemahan Claude")
+    it.add_argument("--part", type=int, default=1, help="nomor bagian terjemahan (default 1)")
     pr = sub.add_parser("probe", help="cek metadata, subtitle, live chat, dan perkiraan sumber daya link YouTube")
     pr.add_argument("url", help="link YouTube")
     pr.add_argument("--range", action="append", default=None, metavar="HH:MM:SS-HH:MM:SS",
                     help="rentang waktu untuk menghitung perkiraan (boleh diulang)")
     pr.add_argument("--type", default=None, help="jenis konten (podcast, stream, variety, news, general)")
+    pr.add_argument("--source-language", default=None, metavar="KODE", help="kode bahasa video sumber (opsional)")
+    pr.add_argument("--target-language", default="id", metavar="KODE",
+                    help="kode bahasa target hasil subtitle (default: id)")
     pr.add_argument("--moments", choices=sorted(MOMENT_SOURCES), default=None,
                     help="pemilih momen (default: pengaturan aplikasi)")
     pr.add_argument("--max-clips", type=int, default=None, help="jumlah klip maksimal untuk perkiraan LLM")
@@ -454,6 +515,7 @@ def _parser() -> argparse.ArgumentParser:
 
 HANDLERS = {"run": cmd_run, "analyze": cmd_analyze, "bench-whisper": cmd_bench_whisper,
             "export-transcript": cmd_export, "import-moments": cmd_import, "export-moments": cmd_export_moments,
+            "export-translation": cmd_export_translation, "import-translation": cmd_import_translation,
             "probe": cmd_probe, "config": cmd_config, "migrate-m1": cmd_migrate, "recover": cmd_recover}
 
 

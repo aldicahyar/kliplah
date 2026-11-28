@@ -355,3 +355,162 @@ def test_api_upload_with_ranges_rejected(client):
                     data={"ranges": "[[0, 60]]"})
     assert r.status_code == 422
     assert r.json()["error"]["code"] == "VALIDATION"
+
+
+def test_create_project_api_accepts_source_language(client, monkeypatch):
+    from app.services import projects
+
+    r = client.post("/api/projects", json={"url": VIDEO_URL, "source_language": "KO", "target_language": "en-US"})
+    assert r.status_code == 201, r.text
+    p = r.json()["project"]
+    assert p["source_language"] == "ko" and p["target_language"] == "en"
+
+    auto_r = client.post("/api/projects", json={"url": VIDEO_URL, "source_language": "auto"})
+    assert auto_r.status_code == 201
+    assert auto_r.json()["project"]["source_language"] is None
+    assert auto_r.json()["project"]["target_language"] == "id"
+
+    bad_src = client.post("/api/projects", json={"url": VIDEO_URL, "source_language": "xx"})
+    assert bad_src.status_code == 422 and bad_src.json()["error"]["code"] == "VALIDATION"
+
+    bad_tgt = client.post("/api/projects", json={"url": VIDEO_URL, "target_language": "xx"})
+    assert bad_tgt.status_code == 422 and bad_tgt.json()["error"]["code"] == "VALIDATION"
+
+    up = client.post(
+        "/api/projects/upload",
+        files={"file": ("v.mp4", b"\x00" * 16, "video/mp4")},
+        data={"source_language": "ja"},
+    )
+    assert up.status_code == 201, up.text
+    assert up.json()["project"]["source_language"] == "ja"
+
+    monkeypatch.setattr(
+        projects,
+        "probe_youtube",
+        lambda url, s, cookies_browser="": VideoMeta(
+            source_type="youtube",
+            project_id="dQw4w9WgXcQ",
+            title="Video",
+            duration=1800.0,
+            video_id="dQw4w9WgXcQ",
+            subtitles={"manual": ["en"], "auto": []},
+            language="ko",
+        ),
+    )
+    pr = client.post("/api/projects/probe", json={"url": VIDEO_URL, "source_language": "en", "target_language": "id"})
+    assert pr.status_code == 200, pr.text
+    body = pr.json()
+    assert body["source_language_hint"] == "ko"
+    assert body["subtitle_plan"] == {"source": "youtube_manual", "language": "en", "needs_translation": True}
+
+
+def test_api_languages_endpoint(client):
+    r = client.get("/api/system/languages")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["low_confidence_prob"] == 0.6
+    by_code = {item["code"]: item for item in body["languages"]}
+    assert {"id", "ms", "en", "ko", "ja", "zh", "th"} <= set(by_code)
+    assert by_code["ko"] == {"code": "ko", "name_id": "Korea", "name_en": "Korean", "whisper": True}
+    for item in body["languages"]:
+        assert set(item) == {"code", "name_id", "name_en", "whisper"}
+
+
+def test_api_translation_export_and_import_flow(client, engine, settings):
+    from app.pipeline.subtitle_lines import clip_subtitle_lines
+
+    p = _add(
+        engine,
+        Project(
+            status="ready",
+            last_completed_stage="prepare",
+            whisper_model="small",
+            source_language="en",
+            target_language="id",
+            transcript_source="whisper",
+            moment_source="claude_manual",
+        ),
+    )
+    t = make_transcript(10, each=6.0).model_copy(update={"language": "en"})
+    d = settings.data_dir / "projects" / p.id
+    (d / "transcripts" / "small").mkdir(parents=True)
+    (d / "transcripts" / "small" / "transcript.json").write_text(t.model_dump_json(), encoding="utf-8")
+    (d / "meta.json").write_text(
+        VideoMeta(source_type="youtube", project_id=p.id, title="Judul", duration=t.duration).model_dump_json(),
+        encoding="utf-8",
+    )
+    orig_subs = clip_subtitle_lines(t, None, 0.0, 12.0, max_words=4, source="whisper")
+    c = _add(
+        engine,
+        Clip(
+            project_id=p.id,
+            origin="manual",
+            rank=1,
+            score=80,
+            pieces=[{"project_id": p.id, "start": 0.0, "end": 12.0}],
+            subtitles=orig_subs,
+            status="rendered",
+        ),
+    )
+
+    bad_scope = client.get(f"/api/projects/{p.id}/translation-export?scope=invalid")
+    assert bad_scope.status_code == 422 and bad_scope.json()["error"]["code"] == "VALIDATION"
+
+    exp = client.get(f"/api/projects/{p.id}/translation-export?scope=clips")
+    assert exp.status_code == 200, exp.text
+    parts = exp.json()
+    assert len(parts) == 1
+    assert (parts[0]["part"], parts[0]["of"], parts[0]["filename"]) == (1, 1, "terjemahan_claude.md")
+    assert "Inggris" in parts[0]["text"] and "[0]" in parts[0]["text"] and "[5]" not in parts[0]["text"]
+
+    bad_imp = client.post(
+        f"/api/projects/{p.id}/translation-import?part=1",
+        content="maaf, saya tidak bisa",
+        headers={"Content-Type": "text/plain"},
+    )
+    assert bad_imp.status_code == 400 and bad_imp.json()["error"]["code"] == "INVALID_IMPORT"
+
+    reply = "Ini hasilnya:\n```json\n" + json.dumps(
+        {
+            "lines": [
+                {"n": 0, "text": "kalimat nol pertama sekali"},
+                {"n": 1, "text": "kalimat satu kedua sekali"},
+            ]
+        }
+    ) + "\n```"
+    imp = client.post(
+        f"/api/projects/{p.id}/translation-import?part=1",
+        content=reply.encode("utf-8"),
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+    )
+    assert imp.status_code == 200, imp.text
+    assert imp.json() == {"merged": 2, "refreshed": [c.id], "skipped": []}
+
+    got_clip = client.get(f"/api/clips/{c.id}").json()
+    assert got_clip["needs_rerender"] is True
+    assert [line["text"] for line in got_clip["subtitles"]] == [
+        "kalimat nol pertama sekali",
+        "kalimat satu kedua sekali",
+    ]
+    assert all(line["source"] == "translated" and line["text_original"] for line in got_clip["subtitles"])
+
+    assert client.get("/api/projects/tidak-ada/translation-export").status_code == 404
+
+    p_id = _add(
+        engine,
+        Project(
+            status="ready",
+            last_completed_stage="prepare",
+            whisper_model="small",
+            source_language="id",
+            target_language="id",
+            transcript_source="whisper",
+        ),
+    )
+    d_id = settings.data_dir / "projects" / p_id.id
+    (d_id / "transcripts" / "small").mkdir(parents=True)
+    (d_id / "transcripts" / "small" / "transcript.json").write_text(
+        make_transcript(4, each=6.0).model_dump_json(), encoding="utf-8"
+    )
+    same = client.get(f"/api/projects/{p_id.id}/translation-export")
+    assert same.status_code == 409 and same.json()["error"]["code"] == "INVALID_STATE"

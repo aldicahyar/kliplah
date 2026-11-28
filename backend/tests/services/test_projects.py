@@ -206,7 +206,7 @@ def test_probe_estimates_and_warns_for_long_video(engine, settings, monkeypatch)
 
     ranged = projects.probe(engine, URL, ranges=[[1800, 3600]], settings=settings)
     assert ranged["warnings"] == []
-    assert ranged["estimate"]["process_minutes"] == 26
+    assert ranged["estimate"]["process_minutes"] == 37
     assert ranged["estimate"]["disk_gb"] == 1.1
 
 
@@ -230,7 +230,7 @@ def test_probe_estimate_includes_encode_time(engine, settings, monkeypatch):
     assert full["estimate"]["process_minutes"] == 6
     assert full["estimate"]["disk_gb"] == 16.1
     assert set(full["estimate"]["breakdown"]) == {
-        "download_min", "encode_min", "transcribe_min", "chat_min", "llm_min",
+        "download_min", "encode_min", "transcribe_min", "chat_min", "translate_min", "llm_min",
     }
     assert full["estimate"]["process_minutes"] == sum(full["estimate"]["breakdown"].values())
 
@@ -240,7 +240,8 @@ def test_probe_breakdown_stream_ollama_30m_range_and_profiles(engine, settings, 
     from app.db.engine import session_scope
     from app.services.settings_store import put_app_settings
 
-    assert projects.CHAT_SEC_PER_HOUR == pytest.approx(300.0)
+    assert projects.WHISPER_FACTOR == pytest.approx(0.85)
+    assert projects.CHAT_SEC_PER_HOUR == pytest.approx(50.0)
     assert projects.LLM_SEC_PER_WINDOW == pytest.approx(480.0)
     assert projects.LLM_SEC_PER_CLIP == pytest.approx(25.0)
 
@@ -254,11 +255,11 @@ def test_probe_breakdown_stream_ollama_30m_range_and_profiles(engine, settings, 
     with session_scope(engine) as s:
         put_app_settings(s, {"content_type": "stream", "moment_source": "ollama", "max_clips": 8}, settings=settings)
 
-    # 30-min range at 05:20-05:50 (19200-21000) -> ~110 min (20% tolerance)
+    # 30-min range at 05:20-05:50 (19200-21000) -> ~93 min
     ranged = projects.probe(engine, URL, ranges=[[19200, 21000]], settings=settings)
     est = ranged["estimate"]
     b = est["breakdown"]
-    assert set(b) == {"download_min", "encode_min", "transcribe_min", "chat_min", "llm_min"}
+    assert set(b) == {"download_min", "encode_min", "transcribe_min", "chat_min", "translate_min", "llm_min"}
     assert est["process_minutes"] == sum(b.values())
     assert 88 <= est["process_minutes"] <= 132
     assert b["chat_min"] > 0 and b["llm_min"] > 0
@@ -320,4 +321,164 @@ def test_create_project_normalizes_source_language(engine, settings):
     with pytest.raises(AppError) as e:
         projects.create_project(engine, url=URL, source_language="xx", settings=settings)
     assert e.value.code == "VALIDATION" and e.value.status == 422
+
+
+def test_probe_reports_subtitle_plan_and_translation_engine(engine, settings, monkeypatch):
+    from app.core.models import VideoMeta
+
+    meta_en = VideoMeta(
+        source_type="youtube",
+        project_id="vid_en",
+        title="English Talk",
+        channel="Ch",
+        duration=1800.0,
+        video_id="vid_en",
+        subtitles={"manual": ["en"], "auto": []},
+        language="ko",
+    )
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_en)
+
+    res_claude = projects.probe(engine, URL, target_language="id", moment_source="claude_manual", settings=settings)
+    assert res_claude["source_language_hint"] == "ko"
+    assert res_claude["subtitle_plan"] == {"source": "youtube_manual", "language": "en", "needs_translation": True}
+    assert res_claude["transcript_source_auto"] == "youtube_manual"
+    assert res_claude["translation_engine"] == "claude"
+
+    res_ollama = projects.probe(engine, URL, target_language="id", moment_source="ollama", settings=settings)
+    assert res_ollama["translation_engine"] == "ollama"
+
+    meta_id = meta_en.model_copy(update={"subtitles": {"manual": ["id", "en"], "auto": []}, "language": "id"})
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_id)
+    res_id = projects.probe(engine, URL, target_language="id", settings=settings)
+    assert res_id["subtitle_plan"] == {"source": "youtube_manual", "language": "id", "needs_translation": False}
+
+    meta_multi = meta_en.model_copy(update={"subtitles": {"manual": ["ja", "th"], "auto": []}})
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_multi)
+    res_th = projects.probe(engine, URL, source_language="TH", target_language="id", settings=settings)
+    assert res_th["subtitle_plan"] == {"source": "youtube_manual", "language": "th", "needs_translation": True}
+
+    with pytest.raises(AppError) as e_src:
+        projects.probe(engine, URL, source_language="xx", settings=settings)
+    assert e_src.value.code == "VALIDATION" and e_src.value.status == 422
+
+    with pytest.raises(AppError) as e_tgt:
+        projects.probe(engine, URL, target_language="xx", settings=settings)
+    assert e_tgt.value.code == "VALIDATION" and e_tgt.value.status == 422
+
+    with pytest.raises(AppError) as e_create_tgt:
+        projects.create_project(engine, url=URL, target_language="xx", settings=settings)
+    assert e_create_tgt.value.code == "VALIDATION" and e_create_tgt.value.status == 422
+
+
+def test_probe_warns_weak_local_translation_for_korean_with_ollama(engine, settings, monkeypatch):
+    from app.core.models import VideoMeta
+
+    meta_ko_sub = VideoMeta(
+        source_type="youtube",
+        project_id="vid_ko",
+        title="Korean Show",
+        duration=1800.0,
+        video_id="vid_ko",
+        subtitles={"manual": ["ko"], "auto": []},
+        language="ko",
+    )
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_ko_sub)
+    res_sub = projects.probe(engine, URL, moment_source="ollama", settings=settings)
+    assert any("Korea" in w and "Claude" in w for w in res_sub["warnings"])
+    assert not any("whisper_model" in w for w in res_sub["warnings"])
+
+    meta_ko_whisper = meta_ko_sub.model_copy(update={"subtitles": {"manual": [], "auto": ["ko"]}})
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_ko_whisper)
+    res_wh = projects.probe(engine, URL, moment_source="ollama", settings=settings)
+    assert any("Korea" in w and "Claude" in w for w in res_wh["warnings"])
+    assert any("whisper_model" in w and "medium" in w for w in res_wh["warnings"])
+
+    meta_fr_whisper = meta_ko_sub.model_copy(update={"subtitles": {"manual": [], "auto": []}, "language": "fr"})
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_fr_whisper)
+    res_fr = projects.probe(engine, URL, source_language="fr", moment_source="ollama", settings=settings)
+    assert not any("Claude" in w for w in res_fr["warnings"])
+    assert any("whisper_model" in w and "medium" in w for w in res_fr["warnings"])
+
+
+def test_probe_no_warning_for_claude_manual(engine, settings, monkeypatch):
+    from app.core.models import VideoMeta
+
+    meta_ko = VideoMeta(
+        source_type="youtube",
+        project_id="vid_ko_manual",
+        title="Korean Show",
+        duration=1800.0,
+        video_id="vid_ko_manual",
+        subtitles={"manual": ["ko"], "auto": []},
+        language="ko",
+    )
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_ko)
+    res = projects.probe(engine, URL, moment_source="claude_manual", settings=settings)
+    assert res["warnings"] == []
+
+    meta_wh = meta_ko.model_copy(update={"subtitles": {"manual": [], "auto": []}})
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_wh)
+    res_wh = projects.probe(engine, URL, source_language="ko", moment_source="claude_manual", settings=settings)
+    assert not any("Claude" in w for w in res_wh["warnings"])
+
+
+def test_probe_estimate_includes_translate_minutes_only_when_needed(engine, settings, monkeypatch):
+    from app.core.models import VideoMeta
+
+    assert projects.TRANSLATE_SEC_PER_MIN == pytest.approx(20.0)
+
+    meta_en = VideoMeta(
+        source_type="youtube",
+        project_id="vid_tr",
+        title="Talk",
+        duration=3600.0,
+        video_id="vid_tr",
+        subtitles={"manual": ["en"], "auto": []},
+    )
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_en)
+
+    # 30 minutes (1800 s): translate_sec = (1800/60)*20 = 600s = 10m
+    ollama_en = projects.probe(engine, URL, ranges=[[0, 1800]], moment_source="ollama", settings=settings)
+    assert ollama_en["estimate"]["breakdown"]["translate_min"] == 10
+    assert ollama_en["estimate"]["process_minutes"] == sum(ollama_en["estimate"]["breakdown"].values())
+
+    claude_en = projects.probe(engine, URL, ranges=[[0, 1800]], moment_source="claude_manual", settings=settings)
+    assert claude_en["estimate"]["breakdown"]["translate_min"] == 0
+
+    meta_id = meta_en.model_copy(update={"subtitles": {"manual": ["id"], "auto": []}})
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_id)
+    ollama_id = projects.probe(engine, URL, ranges=[[0, 1800]], moment_source="ollama", settings=settings)
+    assert ollama_id["estimate"]["breakdown"]["translate_min"] == 0
+
+    meta_wh = meta_en.model_copy(update={"subtitles": {"manual": [], "auto": []}})
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_wh)
+    ollama_wh_ko = projects.probe(
+        engine, URL, ranges=[[0, 1800]], source_language="ko", moment_source="ollama", settings=settings
+    )
+    assert ollama_wh_ko["estimate"]["breakdown"]["translate_min"] == 10
+
+
+def test_probe_constants_calibrated(engine, settings, monkeypatch):
+    from app.core.models import VideoMeta
+
+    assert projects.WHISPER_FACTOR == pytest.approx(0.85)
+    assert projects.CHAT_SEC_PER_HOUR == pytest.approx(50.0)
+    assert projects.TRANSLATE_SEC_PER_MIN == pytest.approx(20.0)
+
+    meta = VideoMeta(
+        source_type="youtube",
+        project_id="vid_cal",
+        title="Stream",
+        duration=31380.0,
+        video_id="vid_cal",
+        subtitles={"manual": [], "auto": ["id"]},
+        has_live_chat=True,
+    )
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta)
+    res = projects.probe(
+        engine, URL, ranges=[[19200, 21000]], content_type="stream", moment_source="ollama", settings=settings
+    )
+    b = res["estimate"]["breakdown"]
+    assert b["chat_min"] == 5
+    assert 25 <= b["transcribe_min"] <= 26
 
