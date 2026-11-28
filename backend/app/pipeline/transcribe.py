@@ -3,7 +3,8 @@ from collections.abc import Callable
 from pathlib import Path
 
 from app.core.fs import atomic_write_json, read_json
-from app.core.models import Transcript, Word
+from app.core.models import Sentence, Transcript, Word
+from app.domain.ranges import RangeFile
 from app.pipeline.corrections import apply_corrections
 from app.pipeline.sentences import split_sentences
 from app.providers.transcriber import Transcriber
@@ -19,7 +20,8 @@ def chunk_bounds(duration: float, chunk_sec: float = 600.0) -> list[tuple[float,
 
 def transcribe(wav: Path, duration: float, out_dir: Path, transcriber: Transcriber, model_name: str,
                corrections: list[tuple[str, str]],
-               on_progress: Callable[[float], None] | None = None) -> Transcript:
+               on_progress: Callable[[float], None] | None = None, language: str = "id") -> Transcript:
+    """Transcribe one audio file; word times are local to that file."""
     final = out_dir / "transcript.json"
     cached = read_json(final)
     if cached:
@@ -39,6 +41,26 @@ def transcribe(wav: Path, duration: float, out_dir: Path, transcriber: Transcrib
             on_progress(round(b / duration, 4))
 
     words = apply_corrections(words, corrections)
-    t = Transcript(language="id", duration=duration, words=words, sentences=split_sentences(words))
+    t = Transcript(language=language, duration=duration, words=words, sentences=split_sentences(words))
     atomic_write_json(final, t.model_dump())
     return t
+
+
+def merge_range_transcripts(parts: list[tuple[RangeFile, list[Word]]], pause_sec: float, language: str,
+                            duration: float) -> Transcript:
+    """One transcript on the original video timeline from per-range words (local times).
+
+    Words are shifted by their range start; sentences are split per range, so no sentence spans two
+    ranges, then numbered globally with `word_range` indexing the merged word list.
+    """
+    words: list[Word] = []
+    sentences: list[Sentence] = []
+    for rf, local in parts:
+        shifted = [w.model_copy(update={"start": round(w.start + rf.start, 3), "end": round(w.end + rf.start, 3)})
+                   for w in local]
+        offset = len(words)
+        for s in split_sentences(shifted, pause_sec):
+            a, b = s.word_range
+            sentences.append(s.model_copy(update={"i": len(sentences), "word_range": (a + offset, b + offset)}))
+        words.extend(shifted)
+    return Transcript(language=language, duration=duration, words=words, sentences=sentences)

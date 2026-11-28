@@ -34,12 +34,15 @@ from app.core.errors import AppError
 from app.core.fs import project_dir
 from app.db.engine import get_engine, init_db, session_scope
 from app.db.tables import Clip, Job, Project, utcnow
+from app.domain.ranges import parse_range
 from app.pipeline.audio import extract_audio
 from app.pipeline.ingest import IngestError, ingest_file, ingest_youtube
+from app.pipeline.youtube_subs import TRANSCRIPT_SOURCES
 from app.providers.transcriber import FasterWhisperTranscriber
 from app.services import clips as clip_service
 from app.services import moments, projects
 from app.services._common import fetch
+from app.services.settings_store import get_app_settings, put_app_settings
 from app.worker import queue
 from app.worker.main import recover_startup, worker_main
 from app.worker.process import STAGES, ProcessDeps, transcript_dir
@@ -48,7 +51,7 @@ log = logging.getLogger("kliplah")
 
 # exit code 2: the user can fix the input; everything else (retryable or runtime) exits 1
 USER_ERRORS = frozenset({"INVALID_URL", "INVALID_IMPORT", "VALIDATION", "NOT_FOUND", "INVALID_STATE",
-                         "VIDEO_UNAVAILABLE", "DOWNLOAD_BLOCKED", "DISK_FULL"})
+                         "VIDEO_UNAVAILABLE", "DOWNLOAD_BLOCKED", "DISK_FULL", "AGE_RESTRICTED"})
 PAUSE_STATUSES = ("awaiting_moments", "ready")
 MOMENT_SOURCES = {"ollama": "ollama", "claude": "claude_manual"}
 WAIT_POLL = 2.0  # seconds between status checks while another worker runs the project's job
@@ -200,10 +203,18 @@ def _create(engine: Engine, settings: Settings, source: str, **options) -> Proje
     return project
 
 
+def _parse_ranges(raw: list[str] | None) -> list[list[float]] | None:
+    if not raw:
+        return None
+    return [[s, e] for s, e in (parse_range(r) for r in raw)]
+
+
 def cmd_run(args, settings: Settings) -> Path:
     settings = _with_models(settings, args)
     engine = _engine(settings)
     project = _create(engine, settings, args.source, content_type=args.type,
+                      ranges=_parse_ranges(args.range), focus_prompt=args.focus,
+                      transcript_source=args.transcript_source,
                       moment_source=MOMENT_SOURCES[args.moments] if args.moments else None,
                       max_clips=args.max_clips, min_clip_sec=args.min_sec, max_clip_sec=args.max_sec)
     if args.queue_only:
@@ -217,6 +228,8 @@ def cmd_export(args, settings: Settings) -> Path:
     settings = _with_models(settings, args)
     engine = _engine(settings)
     project = _create(engine, settings, args.source, content_type=args.type,
+                      ranges=_parse_ranges(args.range), focus_prompt=args.focus,
+                      transcript_source=args.transcript_source,
                       moment_source="claude_manual", max_clips=args.max_clips, min_clip_sec=args.min_sec,
                       max_clip_sec=args.max_sec)
     if args.queue_only:
@@ -320,6 +333,50 @@ def cmd_migrate(args, settings: Settings) -> Path:
     return Path(settings.data_dir)
 
 
+def cmd_probe(args, settings: Settings) -> Path:
+    engine = _engine(settings)
+    info = projects.probe(engine, args.url, ranges=_parse_ranges(args.range), settings=settings)
+    subs = info["subtitles"]
+    print(f"Judul: {info['title']} ({info['channel'] or '-'})")
+    print(f"Durasi: {info['duration']:.0f} detik | Heatmap: {'ya' if info['has_heatmap'] else 'tidak'} | "
+          f"Live chat: {'ya' if info['has_live_chat'] else 'tidak'}")
+    print(f"Subtitle manual: {', '.join(subs.get('manual') or []) or '-'} | "
+          f"auto: {', '.join(subs.get('auto') or []) or '-'}")
+    print(f"Sumber transkrip otomatis: {info['transcript_source_auto']}")
+    est = info["estimate"]
+    print(f"Perkiraan: ~{est['process_minutes']} menit proses, ~{est['disk_gb']} GB disk")
+    for w in info["warnings"]:
+        print(f"Peringatan: {w}")
+    return Path(settings.data_dir)
+
+
+def cmd_config(args, settings: Settings) -> Path:
+    engine = _engine(settings)
+    if args.action == "get":
+        with session_scope(engine) as s:
+            vals = get_app_settings(s, settings=settings)
+        if args.key:
+            if args.key not in vals:
+                raise AppError("VALIDATION", f"Pengaturan tidak dikenal: {args.key}.", status=422)
+            print(f"{args.key}={vals[args.key]}")
+        else:
+            for k, v in vals.items():
+                print(f"{k}={v}")
+        return Path(settings.data_dir)
+    if args.value is None:
+        raise AppError("VALIDATION", "Nilai pengaturan wajib diisi.", status=422)
+    val: str | int = args.value
+    if args.key in ("max_clips", "encode_threads", "range_max_height"):
+        try:
+            val = int(args.value)
+        except ValueError:
+            raise AppError("VALIDATION", f"Nilai '{args.key}' harus berupa bilangan bulat.", status=422) from None
+    with session_scope(engine) as s:
+        updated = put_app_settings(s, {args.key: val}, settings=settings)
+    print(f"{args.key}={updated[args.key]}")
+    return Path(settings.data_dir)
+
+
 # ---------- entry point ----------
 
 def _parser() -> argparse.ArgumentParser:
@@ -333,6 +390,11 @@ def _parser() -> argparse.ArgumentParser:
     def new_project(sp):
         sp.add_argument("source", help="link YouTube atau file video")
         sp.add_argument("--type", default=None, help="jenis konten (podcast, stream, variety, news, general)")
+        sp.add_argument("--range", action="append", default=None, metavar="HH:MM:SS-HH:MM:SS",
+                        help="rentang waktu yang diproses (boleh diulang)")
+        sp.add_argument("--focus", default=None, help="arahan momen yang dicari")
+        sp.add_argument("--transcript-source", choices=TRANSCRIPT_SOURCES, default="auto",
+                        help="sumber transkrip (auto, youtube_manual, youtube_auto, whisper)")
         sp.add_argument("--max-clips", type=int, default=None)
         sp.add_argument("--min-sec", type=int, default=None)
         sp.add_argument("--max-sec", type=int, default=None)
@@ -357,6 +419,14 @@ def _parser() -> argparse.ArgumentParser:
     im.add_argument("reply", help="file berisi balasan Claude")
     im.add_argument("--part", type=int, default=1, help="nomor bagian transkrip (default 1)")
     jobs(im)
+    pr = sub.add_parser("probe", help="cek metadata, subtitle, live chat, dan perkiraan sumber daya link YouTube")
+    pr.add_argument("url", help="link YouTube")
+    pr.add_argument("--range", action="append", default=None, metavar="HH:MM:SS-HH:MM:SS",
+                    help="rentang waktu untuk menghitung perkiraan (boleh diulang)")
+    cfg = sub.add_parser("config", help="lihat atau ubah pengaturan aplikasi (mis. cookies_browser)")
+    cfg.add_argument("action", choices=("get", "set"))
+    cfg.add_argument("key", nargs="?", default=None)
+    cfg.add_argument("value", nargs="?", default=None)
     bw = sub.add_parser("bench-whisper", help="bandingkan model Whisper")
     bw.add_argument("source")
     bw.add_argument("--models", nargs="+", default=["small", "medium"])
@@ -369,7 +439,7 @@ def _parser() -> argparse.ArgumentParser:
 
 HANDLERS = {"run": cmd_run, "analyze": cmd_analyze, "bench-whisper": cmd_bench_whisper,
             "export-transcript": cmd_export, "import-moments": cmd_import, "export-moments": cmd_export_moments,
-            "migrate-m1": cmd_migrate, "recover": cmd_recover}
+            "probe": cmd_probe, "config": cmd_config, "migrate-m1": cmd_migrate, "recover": cmd_recover}
 
 
 def main(argv: list[str] | None = None) -> int:

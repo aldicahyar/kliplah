@@ -17,7 +17,7 @@ def test_init_db_creates_tables_and_schema_version(tmp_path):
     with engine.connect() as conn:
         names = {r[0] for r in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
         assert EXPECTED_TABLES <= names
-        assert conn.execute(text("SELECT version FROM schema_version")).scalar_one() == 1
+        assert conn.execute(text("SELECT version FROM schema_version")).scalar_one() == 2
     assert (tmp_path / "kliplah.db").exists()
 
 
@@ -35,7 +35,7 @@ def test_init_db_is_idempotent(tmp_path):
     init_db(engine)
     with engine.connect() as conn:
         rows = conn.execute(text("SELECT version FROM schema_version")).all()
-    assert [r[0] for r in rows] == [1]
+    assert [r[0] for r in rows] == [2]
 
 
 def test_json_columns_roundtrip(tmp_path):

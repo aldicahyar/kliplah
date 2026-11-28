@@ -12,6 +12,7 @@ from sqlalchemy import Engine
 from app.api.deps import dump, file_or_404, get_engine_dep, get_settings_dep
 from app.core.config import Settings
 from app.core.errors import AppError
+from app.core.fs import read_json
 from app.services import clips, moments, projects
 from app.worker.process import transcript_dir
 
@@ -35,6 +36,11 @@ class ProjectCreate(ProjectOptions):
     url: str
 
 
+class ProbeRequest(BaseModel):
+    url: str
+    ranges: list | None = None
+
+
 class ManualClip(BaseModel):
     start: float
     end: float
@@ -43,6 +49,12 @@ class ManualClip(BaseModel):
 def _created(engine: Engine, project) -> dict:
     _, job = projects.get_project(engine, project.id)
     return {"project": dump(project), "job": dump(job)}
+
+
+@router.post("/probe")
+def probe_project(body: ProbeRequest, engine: Engine = Depends(get_engine_dep),
+                  settings: Settings = Depends(get_settings_dep)) -> dict:
+    return projects.probe(engine, body.url, ranges=body.ranges, settings=settings)
 
 
 @router.post("", status_code=201)
@@ -96,9 +108,15 @@ def list_projects(engine: Engine = Depends(get_engine_dep)) -> list[dict]:
 
 
 @router.get("/{project_id}")
-def get_project(project_id: str, engine: Engine = Depends(get_engine_dep)) -> dict:
+def get_project(project_id: str, engine: Engine = Depends(get_engine_dep),
+                settings: Settings = Depends(get_settings_dep)) -> dict:
     project, job = projects.get_project(engine, project_id)
-    return {"project": dump(project), "active_job": dump(job)}
+    meta_raw = read_json(Path(settings.data_dir) / "projects" / project_id / "meta.json")
+    ranges = [
+        {"index": r["index"], "start": r["start"], "end": r["end"]}
+        for r in (meta_raw or {}).get("ranges", [])
+    ]
+    return {"project": dump(project), "active_job": dump(job), "ranges": ranges}
 
 
 @router.patch("/{project_id}")
@@ -147,9 +165,15 @@ def moments_finish(project_id: str, allow_missing: bool = Query(False), engine: 
 # ---------- files ----------
 
 @router.get("/{project_id}/proxy")
-def proxy(project_id: str, engine: Engine = Depends(get_engine_dep), settings: Settings = Depends(get_settings_dep)):
+def proxy(project_id: str, range_idx: int = Query(0, alias="range", ge=0),
+          engine: Engine = Depends(get_engine_dep), settings: Settings = Depends(get_settings_dep)):
     projects.get_project(engine, project_id)  # NOT_FOUND for an unknown project
-    path = Path(settings.data_dir) / "projects" / project_id / "proxy.mp4"
+    d = Path(settings.data_dir) / "projects" / project_id
+    meta_raw = read_json(d / "meta.json")
+    if meta_raw and meta_raw.get("ranges"):
+        path = d / f"proxy_r{range_idx}.mp4"
+    else:
+        path = d / "proxy.mp4" if range_idx == 0 else d / f"proxy_r{range_idx}.mp4"
     return file_or_404(path, "proxy video", media_type="video/mp4")
 
 

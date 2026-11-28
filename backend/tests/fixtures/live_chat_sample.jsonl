@@ -1,0 +1,6 @@
+{"replayChatItemAction": {"actions": [{"addChatItemAction": {"item": {"liveChatTextMessageRenderer": {"message": {"runs": [{"text": "halo semuanya"}]}}}}}], "videoOffsetTimeMsec": "1500"}}
+{"replayChatItemAction": {"actions": [{"addChatItemAction": {"item": {"liveChatTextMessageRenderer": {"message": {"runs": [{"text": "wkwkwk "}, {"emoji": {"emojiId": "😂", "shortcuts": [":joy:"]}}]}}}}}], "videoOffsetTimeMsec": "12300"}}
+{baris rusak bukan json
+{"replayChatItemAction": {"actions": [{"addChatItemAction": {"item": {"liveChatPaidMessageRenderer": {"message": {"runs": [{"text": "mantap bang"}]}}}}}], "videoOffsetTimeMsec": "45000"}}
+{"replayChatItemAction": {"actions": [{"addChatItemAction": {"item": {"liveChatTextMessageRenderer": {"message": {"runs": [{"text": "prestream"}]}}}}}], "videoOffsetTimeMsec": "-1000"}}
+{"replayChatItemAction": {"actions": [{"addChatItemAction": {"item": {"liveChatTextMessageRenderer": {"message": {"runs": [{"text": "kaget anjir"}]}}}}}], "videoOffsetTimeMsec": "60250"}}

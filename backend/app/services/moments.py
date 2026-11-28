@@ -18,8 +18,10 @@ from app.core.models import Transcript, VideoMeta
 from app.db.engine import session_scope
 from app.db.tables import Job, Project, utcnow
 from app.domain.profiles import profile_for
-from app.pipeline.analyze import import_external, transcript_lines
+from app.domain.ranges import SourceMap
+from app.pipeline.analyze import focus_block, import_external, profile_criteria_line, transcript_lines
 from app.pipeline.llm_json import parse_llm_json, render_prompt
+from app.pipeline.signals import load_signals
 from app.worker import queue
 from app.worker.process import save_picks, transcript_dir
 
@@ -103,10 +105,12 @@ def export_parts(engine: Engine, project_id: str, settings: Settings | None = No
                            status=409) from e
     n = len(ctx.parts)
     out = []
+    criteria = profile_criteria_line(ctx.project.content_type)
+    focus = focus_block(ctx.project.focus_prompt)
     for k, (a, b) in enumerate(ctx.parts, start=1):
         note = f"Ini bagian {k} dari {n}; hanya pakai kalimat [{a}]–[{b}]." if n > 1 else ""
         text = render_prompt("claude_manual", max_candidates=ctx.project.max_clips, min_sec=ctx.min_sec,
-                             max_sec=ctx.max_sec, part_note=note,
+                             max_sec=ctx.max_sec, part_note=note, criteria=criteria, focus=focus,
                              transcript=transcript_lines(ctx.transcript, a, b + 1))
         name = _filename(k, n)
         ctx.tdir.mkdir(parents=True, exist_ok=True)
@@ -164,9 +168,12 @@ def finish_moments(engine: Engine, project_id: str, allow_missing: bool = False,
             raise AppError("INVALID_STATE", "Data video (meta.json) tidak ditemukan; proses ulang project ini.",
                            status=409)
         p = ctx.project
+        meta = VideoMeta.model_validate(meta_raw)
+        signals = load_signals(ctx.dir / "signals.json")
+        smap = SourceMap.from_meta(meta, ctx.dir, ctx.transcript)
         try:
-            picks = import_external(ctx.transcript, VideoMeta.model_validate(meta_raw), {"clips": rows},
-                                    p.max_clips, ctx.min_sec, ctx.max_sec)
+            picks = import_external(ctx.transcript, meta, {"clips": rows}, p.max_clips, ctx.min_sec, ctx.max_sec,
+                                    signals=signals, content_type=p.content_type, source_map=smap)
         except ValueError as e:
             raise AppError("INVALID_IMPORT", str(e)) from e
         save_picks(ctx.dir / "picks.json", picks)

@@ -8,6 +8,8 @@ class Word(BaseModel):
     w: str
     start: float
     end: float
+    approx: bool = False  # True when timing is interpolated (subtitle without per-word times)
+    prob: float | None = None
 
 
 class Sentence(BaseModel):
@@ -39,6 +41,11 @@ class VideoMeta(BaseModel):
     duration: float
     video_id: str | None = None
     heatmap: list[HeatPoint] = []
+    ranges: list[dict] = []  # {"index": int, "start": float, "end": float, "file": str}
+    chapters: list[dict] = []  # {"start", "end", "title"}
+    subtitles: dict = {}  # {"manual": [lang...], "auto": [lang...]}
+    has_live_chat: bool = False
+    transcript_source: str | None = None  # source actually used
 
 
 class Window(BaseModel):
@@ -61,6 +68,7 @@ class Candidate(BaseModel):
     reason: str
     hook: str
     heatmap_bonus: int = 0
+    signal_bonus: int = 0
     score: int = 0
     no_ai: bool = False
 

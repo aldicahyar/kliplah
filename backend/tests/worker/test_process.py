@@ -9,6 +9,7 @@ from app.core.models import Candidate, Materials, PlatformCaption, VideoMeta
 from app.db.engine import get_engine, init_db
 from app.db.tables import Job, Project
 from app.pipeline.ingest import IngestError
+from app.pipeline.signals import Signals
 from app.worker import process, queue
 from app.worker.process import STAGES, ProcessDeps, load_picks, run_process_job, save_picks
 from tests.helpers import make_transcript
@@ -73,6 +74,10 @@ class Recorder:
         (tdir / "transcript.json").write_text(self.transcript.model_dump_json(), encoding="utf-8")
         return self.transcript
 
+    def signals(self, project, meta, smap, settings):
+        self._hit("signals")
+        return Signals()
+
     def analyze(self, t, meta, max_clips, min_sec, max_sec, checkpoint_dir, settings):
         self._hit("analyze")
         return self.picks
@@ -84,7 +89,7 @@ class Recorder:
     def deps(self) -> ProcessDeps:
         return ProcessDeps(settings=self.settings, ingest=self.ingest, extract_audio=self.extract_audio,
                            detect_silences=self.detect_silences, transcribe=self.transcribe,
-                           analyze=self.analyze, prepare=self.prepare)
+                           signals=self.signals, analyze=self.analyze, prepare=self.prepare)
 
 
 def _setup(engine, **fields) -> tuple[str, str]:
@@ -105,14 +110,14 @@ def _rows(engine, pid, jid) -> tuple[Project, Job]:
 
 
 def test_stages_constant():
-    assert STAGES == ("ingest", "audio", "transcribe", "moments", "prepare")
+    assert STAGES == ("ingest", "audio", "transcribe", "signals", "moments", "prepare")
 
 
 def test_process_runs_all_stages_with_ollama_source(engine, settings):
     pid, jid = _setup(engine, moment_source="ollama")
     rec = Recorder(settings)
     assert run_process_job(engine, jid, rec.deps()) == "done"
-    assert rec.calls == ["ingest", "extract_audio", "detect_silences", "transcribe", "analyze", "prepare"]
+    assert rec.calls == ["ingest", "extract_audio", "detect_silences", "transcribe", "signals", "analyze", "prepare"]
     p, j = _rows(engine, pid, jid)
     assert p.status == "ready" and p.last_completed_stage == "prepare"
     assert j.status == "succeeded" and j.progress == 1.0
@@ -140,7 +145,7 @@ def test_claude_manual_pauses_after_transcribe(engine, settings):
     assert run_process_job(engine, jid, rec.deps()) == "paused"
     assert "analyze" not in rec.calls and "prepare" not in rec.calls
     p, j = _rows(engine, pid, jid)
-    assert p.status == "awaiting_moments" and p.last_completed_stage == "transcribe"
+    assert p.status == "awaiting_moments" and p.last_completed_stage == "signals"
     assert j.status == "succeeded"
 
 
@@ -163,7 +168,7 @@ def test_resume_skips_completed_stages(engine, settings):
     deps = rec.deps()
     deps.analyze = analyze
     assert run_process_job(engine, jid, deps) == "done"
-    assert rec.calls == ["analyze", "prepare"]
+    assert rec.calls == ["signals", "analyze", "prepare"]
     assert seen == {"t": rec.transcript, "meta": meta, "ck": tdir / "checkpoints"}
     assert _rows(engine, pid, jid)[0].status == "ready"
 
@@ -253,25 +258,34 @@ def test_default_ingest_upload_path_from_project_row(engine, settings, monkeypat
     pid, jid = _setup(engine, source_type="upload", youtube_url=None, original_filename="rekaman.mp4")
     seen = {}
 
-    def fake_ingest_file(path, s, project_id=None):
-        seen.update(path=path, project_id=project_id)
+    def fake_ingest_file(path, s, project_id=None, ranges=None):
+        seen.update(path=path, project_id=project_id, ranges=ranges)
         raise IngestError("INVALID_URL", "stop")
 
     monkeypatch.setattr(process, "ingest_file", fake_ingest_file)
     deps = Recorder(settings).deps()
     deps.ingest = process.default_ingest
     run_process_job(engine, jid, deps)
-    assert seen == {"path": settings.data_dir / "uploads" / pid / "rekaman.mp4", "project_id": pid}
+    assert seen == {"path": settings.data_dir / "uploads" / pid / "rekaman.mp4", "project_id": pid, "ranges": None}
 
 
 def test_default_ingest_youtube_uses_project_id(engine, settings, monkeypatch):
+    import os
+
     pid, _ = _setup(engine)
     seen = {}
-    monkeypatch.setattr(process, "ingest_youtube", lambda url, s, project_id=None: seen.update(
-        url=url, project_id=project_id))
+    monkeypatch.setattr(
+        process, "ingest_youtube",
+        lambda url, s, project_id=None, ranges=None, cookies_browser="", encode_threads=None, range_max_height=None:
+        seen.update(url=url, project_id=project_id, ranges=ranges, cookies_browser=cookies_browser,
+                    encode_threads=encode_threads, range_max_height=range_max_height),
+    )
     with Session(engine) as s:
         process.default_ingest(s.get(Project, pid), settings)
-    assert seen == {"url": "https://youtu.be/dQw4w9WgXcQ", "project_id": pid}
+    assert seen == {
+        "url": "https://youtu.be/dQw4w9WgXcQ", "project_id": pid, "ranges": None,
+        "cookies_browser": "", "encode_threads": max(1, (os.cpu_count() or 1) - 2), "range_max_height": 720,
+    }
 
 
 def test_picks_roundtrip(tmp_path):

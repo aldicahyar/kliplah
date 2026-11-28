@@ -2,17 +2,19 @@
 
 Aplikasi pribadi yang mengubah video panjang dari YouTube atau file lokal (podcast, stream, variety show, berita) menjadi klip vertikal 9:16 lengkap dengan hook dan subtitle, siap diunggah ke TikTok, Instagram Reels, dan YouTube Shorts. Semua proses berjalan **lokal** di laptop, tanpa GPU dan tanpa API berbayar. Momen menarik dipilih oleh Claude lewat langganan Anda sendiri (default) atau oleh model lokal lewat Ollama.
 
-Status: **S1 selesai: API + worker.** Backend sudah punya REST API, worker dengan antrean SQLite, dan model data v2 (jenis konten, gaya tiga lapis, klip sebagai daftar potongan). Website (review dan edit klip di browser) menyusul setelah tahap sistem S2–S4.
+Status: **S2 selesai (uji video asli menyusul): API + worker + input & sinyal.** Backend sudah mendukung `probe`, unduhan per rentang waktu, cookies browser, subtitle resmi/otomatis YouTube sebagai sumber transkrip, sinyal live chat + puncak suara, arahan `focus_prompt`, profil konten, dan model data v2. Website (review dan edit klip di browser) menyusul setelah tahap sistem S3–S4.
 
 ## Cara kerja singkat
 
 ```text
-link YouTube / file video
-  -> unduh (yt-dlp, + heatmap "paling sering diputar ulang")
-  -> transkrip bahasa Indonesia (faster-whisper, CPU, per 10 menit, bisa dilanjutkan)
+link YouTube / file video (+ opsional: --range, --focus, --transcript-source)
+  -> probe (durasi, subtitle, live chat, perkiraan disk & waktu)
+  -> unduh (yt-dlp penuh 1080p tanpa encode ulang, atau per rentang maks 720p + encode cepat ke source_r<i>.mp4, opsional cookies_browser)
+  -> audio & jeda + transkrip (subtitle YouTube json3 atau faster-whisper CPU per 10 menit)
+  -> sinyal (heatmap, puncak live chat, puncak suara ebur128)
   -> pilih momen: Claude manual (default, project menunggu balasan Anda)
-                  atau Ollama qwen3:4b (otomatis, per jendela 5 menit + pergantian topik + heatmap)
-  -> rapikan batas klip (kata -> kalimat -> jeda), crop 9:16 per adegan (MediaPipe), thumbnail
+                  atau Ollama qwen3:4b (otomatis, profil konten + focus_prompt + bonus sinyal)
+  -> rapikan batas klip (kata -> kalimat -> jeda), crop 9:16 per adegan (MediaPipe), thumbnail, proxy
   -> setujui klip -> render (hook + subtitle tertanam, volume -14 LUFS)
 ```
 
@@ -55,7 +57,7 @@ curl.exe http://127.0.0.1:8000/api/projects/<project_id>/clips    # daftar klip
 curl.exe -X POST http://127.0.0.1:8000/api/clips/<clip_id>/approve # setujui -> render
 ```
 
-Endpoint lain: unggah file (`POST /api/projects/upload`), edit klip (`PATCH /api/clips/{id}`), aksi massal (`POST /api/clips/bulk`), template gaya (`/api/style-templates`), pengaturan (`/api/system/settings`), dan status sistem (`GET /api/system/health`). Daftar lengkapnya ada di `/docs`.
+Endpoint lain: cek link sebelum proses (`POST /api/projects/probe`), unggah file (`POST /api/projects/upload`), edit klip (`PATCH /api/clips/{id}`), aksi massal (`POST /api/clips/bulk`), template gaya (`/api/style-templates`), pengaturan (`/api/system/settings`, termasuk `cookies_browser`, `encode_threads`, `range_max_height`), dan status sistem (`GET /api/system/health`). Daftar lengkapnya ada di `/docs`.
 
 ## Memilih momen dengan Claude (default, tanpa biaya API, tanpa Ollama)
 
@@ -90,7 +92,11 @@ Untuk memakai Ollama sebagai default, ubah pengaturan: `PUT /api/system/settings
 
 ```powershell
 cd backend
-uv run python -m app.cli run "https://www.youtube.com/watch?v=..."               # proses; dengan Claude manual berhenti di file ekspor
+uv run python -m app.cli probe "https://www.youtube.com/watch?v=..." --range 00:30:00-01:00:00
+uv run python -m app.cli config set cookies_browser chrome                       # untuk video dibatasi umur
+uv run python -m app.cli config set encode_threads 4                             # jumlah thread CPU saat encode rentang
+uv run python -m app.cli config set range_max_height 720                         # resolusi maks rentang (480/720/1080)
+uv run python -m app.cli run "https://www.youtube.com/watch?v=..." --type stream --range 05:20:00-05:50:00 --focus "reaksi pertama masuk dunia GTA 6" --moments ollama --no-render
 uv run python -m app.cli run "D:\rekaman\episode1.mp4" --moments ollama --no-render
 uv run python -m app.cli analyze <project_id> --llm-model gemma3:4b              # pilih momen ulang dengan Ollama
 uv run python -m app.cli bench-whisper "<link atau file>" --models small medium --seconds 300
@@ -99,6 +105,8 @@ uv run python -m app.cli recover       # kembalikan job yang tertinggal ke antre
 ```
 
 CLI menulis ke database yang sama dengan API, dan tanpa opsi tambahan menjalankan job project-nya sendiri secara langsung.
+
+- **Unduhan per rentang (`--range`):** setiap rentang diunduh maksimal `720p` (`range_max_height`: `480`, `720`, atau `1080`) lalu di-encode cepat (`libx264 ultrafast`, output klip akhir tetap `1080x1920`) supaya batas waktu tepat tanpa membebani CPU laptop. Jumlah thread CPU diatur lewat `encode_threads` (default `cpu_count - 2`, minimal `1`, mis. `config set encode_threads 4`). Video penuh tetap diunduh sesuai `MAX_VIDEO_HEIGHT` (`1080p`) tanpa encode ulang.
 
 - **Saat `scripts/dev.py` sedang berjalan**, tambahkan `--queue-only` (untuk `run`, `export-transcript`, `analyze`, `import-moments`) supaya CLI hanya mengantrekan job dan worker yang memprosesnya.
 - **`recover` hanya untuk saat tidak ada worker yang berjalan.** Perintah ini mengembalikan job `running` dan klip `rendering` yang tertinggal (misalnya karena laptop mati) ke antrean. Jika dijalankan saat `dev.py` aktif, job yang sedang dikerjakan worker ikut dianggap tertinggal. Worker sendiri melakukan pemulihan ini otomatis setiap kali menyala.

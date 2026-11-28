@@ -8,7 +8,7 @@ from sqlmodel import Session, SQLModel
 
 from app.core.errors import AppError
 
-STATUS = {"NOT_FOUND": 404, "INVALID_STATE": 409, "VALIDATION": 422, "INVALID_URL": 400}
+STATUS = {"NOT_FOUND": 404, "INVALID_STATE": 409, "VALIDATION": 422, "INVALID_URL": 400, "AGE_RESTRICTED": 400}
 
 T = TypeVar("T", bound=SQLModel)
 

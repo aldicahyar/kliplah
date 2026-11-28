@@ -1,0 +1,8 @@
+{"wireMagic": "pb3", "events": [
+  {"tStartMs": 0, "dDurationMs": 5500, "id": 1, "wpWinPosId": 1, "wsWinStyleId": 1},
+  {"tStartMs": 500, "dDurationMs": 3000, "wWinId": 1, "segs": [{"utf8": "selamat", "acAsrConf": 0},
+    {"utf8": " pagi", "tOffsetMs": 400, "acAsrConf": 0}, {"utf8": " teman", "tOffsetMs": 900, "acAsrConf": 0}]},
+  {"tStartMs": 2900, "dDurationMs": 600, "wWinId": 1, "aAppend": 1, "segs": [{"utf8": "\n"}]},
+  {"tStartMs": 3500, "dDurationMs": 2000, "wWinId": 1, "segs": [{"utf8": "ayo", "acAsrConf": 0},
+    {"utf8": " mulai", "tOffsetMs": 700, "acAsrConf": 0}]}
+]}

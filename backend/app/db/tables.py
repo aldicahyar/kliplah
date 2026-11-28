@@ -1,4 +1,4 @@
-"""SQLModel tables (schema version 1). Table names are SQLModel defaults (lowercase class name)."""
+"""SQLModel tables (schema version 2). Table names are SQLModel defaults (lowercase class name)."""
 import uuid
 from datetime import datetime, timezone
 
@@ -86,6 +86,7 @@ class Clip(SQLModel, table=True):
     score: int
     llm_score: int | None = None
     heatmap_bonus: int = 0
+    signal_bonus: int = 0
     category: str = ""
     reason: str = ""
     pieces: list = Field(default_factory=list, sa_column=_json(nullable=False))

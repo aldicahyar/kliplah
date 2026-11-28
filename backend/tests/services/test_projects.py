@@ -82,11 +82,10 @@ def test_create_project_upload_moves_file(engine, settings, tmp_path):
     src = tmp_path / "incoming" / "tmp123.part"
     src.parent.mkdir()
     src.write_bytes(b"video")
-    p = projects.create_project(engine, upload_path=src, original_filename="rekaman saya.mp4",
-                                ranges=[[0, 60]], settings=settings)
+    p = projects.create_project(engine, upload_path=src, original_filename="rekaman saya.mp4", settings=settings)
     dest = settings.data_dir / "uploads" / p.id / "rekaman saya.mp4"
     assert dest.read_bytes() == b"video" and not src.exists()
-    assert p.source_type == "upload" and p.original_filename == "rekaman saya.mp4" and p.ranges == [[0, 60]]
+    assert p.source_type == "upload" and p.original_filename == "rekaman saya.mp4" and p.ranges is None
     assert [j.type for j in _jobs(engine, p.id)] == ["process"]
 
 
@@ -186,3 +185,69 @@ def test_facecam_box_change_flags_rendered_facecam_clips(engine, ready_project, 
     with Session(engine) as s:
         assert s.get(Clip, facecam.id).needs_rerender is True
         assert s.get(Clip, plain.id).needs_rerender is False
+
+
+def test_probe_estimates_and_warns_for_long_video(engine, settings, monkeypatch):
+    from app.core.models import VideoMeta
+
+    meta = VideoMeta(
+        source_type="youtube", project_id="vid1", title="Stream 8 Jam", channel="Tara",
+        duration=31380.0, video_id="vid1", heatmap=[], chapters=[{"start": 0.0, "end": 600.0, "title": "Intro"}],
+        subtitles={"manual": ["en"], "auto": ["id"]}, has_live_chat=True,
+    )
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta)
+
+    full = projects.probe(engine, URL, settings=settings)
+    assert full["title"] == "Stream 8 Jam" and full["channel"] == "Tara" and full["duration"] == 31380.0
+    assert full["has_live_chat"] is True and full["has_heatmap"] is False
+    assert full["transcript_source_auto"] == "whisper"
+    assert full["warnings"] and any("2 jam" in w for w in full["warnings"])
+    assert full["estimate"]["disk_gb"] > 40.0
+
+    ranged = projects.probe(engine, URL, ranges=[[1800, 3600]], settings=settings)
+    assert ranged["warnings"] == []
+    assert ranged["estimate"]["process_minutes"] == 26
+    assert ranged["estimate"]["disk_gb"] == 1.1
+
+
+def test_probe_estimate_includes_encode_time(engine, settings, monkeypatch):
+    from app.core.models import VideoMeta
+
+    assert projects.ENCODE_FACTOR == pytest.approx(0.35)
+    meta = VideoMeta(
+        source_type="youtube", project_id="vid2", title="Stream", channel="Ch",
+        duration=10800.0, video_id="vid2", subtitles={"manual": ["id"], "auto": []}, has_live_chat=False,
+    )
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta)
+
+    # 30 minutes (1800 s) with youtube_manual (no whisper): 60 s download + 630 s encode = 690 s -> 12 min, 1.1 GB
+    ranged = projects.probe(engine, URL, ranges=[[0, 1800]], settings=settings)
+    assert ranged["estimate"]["process_minutes"] == 12
+    assert ranged["estimate"]["disk_gb"] == 1.1
+
+    # Full video keeps 1.5 MB/s and adds no encode factor (10800 s -> 360 s download = 6 min)
+    full = projects.probe(engine, URL, settings=settings)
+    assert full["estimate"]["process_minutes"] == 6
+    assert full["estimate"]["disk_gb"] == 16.1
+
+
+def test_create_project_normalizes_ranges(engine, settings):
+    p = projects.create_project(
+        engine, url=URL, ranges=[[3600, 3900], [1800, 2000], [1900, 2100]],
+        transcript_source="youtube_auto", settings=settings,
+    )
+    assert p.ranges == [[1800.0, 2100.0], [3600.0, 3900.0]]
+    assert p.transcript_source == "youtube_auto"
+    with pytest.raises(AppError) as e:
+        projects.create_project(engine, url=URL, transcript_source="gpt", settings=settings)
+    assert e.value.code == "VALIDATION" and e.value.status == 422
+
+
+def test_create_upload_with_ranges_rejected(engine, settings, tmp_path):
+    src = tmp_path / "up.mp4"
+    src.write_bytes(b"video")
+    with pytest.raises(AppError) as e:
+        projects.create_project(engine, upload_path=src, original_filename="up.mp4",
+                                ranges=[[0, 60]], settings=settings)
+    assert e.value.code == "VALIDATION" and e.value.status == 422
+    assert src.exists()

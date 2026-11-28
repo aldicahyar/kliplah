@@ -32,9 +32,12 @@ def apply_corrections(words: list[Word], rules: list[tuple[str, str]]) -> list[W
         for toks, dst in compiled:
             n = len(toks)
             if norm[i:i + n] == toks:
-                punct = _TRAILING_PUNCT.search(words[i + n - 1].w)
+                span = words[i:i + n]
+                punct = _TRAILING_PUNCT.search(span[-1].w)
                 out.append(Word(w=dst + (punct.group(0) if punct else ""),
-                                start=words[i].start, end=words[i + n - 1].end))
+                                start=words[i].start, end=span[-1].end,
+                                approx=any(w.approx for w in span),
+                                prob=words[i].prob if n == 1 else None))
                 i += n
                 break
         else:

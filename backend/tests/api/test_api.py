@@ -281,3 +281,76 @@ def test_error_envelopes_carry_cors_header(client):
               client.post("/api/projects", json={}, headers=origin)):
         assert r.status_code in (404, 422)
         assert r.headers.get("access-control-allow-origin") == "http://localhost:5173"
+
+
+def test_proxy_range_param_serves_range_file(client, engine, settings):
+    p = _add(engine, Project(status="ready"))
+    d = settings.data_dir / "projects" / p.id
+    d.mkdir(parents=True)
+    ranges_meta = [
+        {"index": 0, "start": 0.0, "end": 60.0, "file": "source_r0.mp4"},
+        {"index": 1, "start": 1800.0, "end": 1900.0, "file": "source_r1.mp4"},
+    ]
+    (d / "meta.json").write_text(
+        VideoMeta(source_type="youtube", project_id=p.id, title="T", duration=3600.0,
+                  ranges=ranges_meta).model_dump_json(),
+        encoding="utf-8",
+    )
+    (d / "proxy_r0.mp4").write_bytes(b"proxy0")
+    (d / "proxy_r1.mp4").write_bytes(b"proxy1")
+
+    r0 = client.get(f"/api/projects/{p.id}/proxy")
+    assert r0.status_code == 200 and r0.content == b"proxy0"
+    r1 = client.get(f"/api/projects/{p.id}/proxy?range=1")
+    assert r1.status_code == 200 and r1.content == b"proxy1"
+    r_missing = client.get(f"/api/projects/{p.id}/proxy?range=2")
+    assert r_missing.status_code == 404
+
+    got = client.get(f"/api/projects/{p.id}").json()
+    assert got["ranges"] == [
+        {"index": 0, "start": 0.0, "end": 60.0},
+        {"index": 1, "start": 1800.0, "end": 1900.0},
+    ]
+
+
+def test_api_probe_endpoint(client, monkeypatch):
+    from app.services import projects
+
+    seen = {}
+
+    def fake_probe(url, s, cookies_browser=""):
+        seen.update(url=url, cookies_browser=cookies_browser)
+        return VideoMeta(
+            source_type="youtube", project_id="dQw4w9WgXcQ", title="Video", channel="Ch",
+            duration=3600.0, video_id="dQw4w9WgXcQ", subtitles={"manual": ["id"], "auto": []},
+            has_live_chat=False,
+        )
+
+    monkeypatch.setattr(projects, "probe_youtube", fake_probe)
+    assert client.put("/api/system/settings", json={"cookies_browser": "chrome"}).status_code == 200
+    r = client.post("/api/projects/probe", json={"url": VIDEO_URL, "ranges": [[0, 1800]]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert seen == {"url": VIDEO_URL, "cookies_browser": "chrome"}
+    assert body["transcript_source_auto"] == "youtube_manual"
+    assert body["estimate"]["process_minutes"] == 12
+
+
+def test_api_probe_age_restricted_400(client, monkeypatch):
+    from app.pipeline.ingest import IngestError
+    from app.services import projects
+
+    def boom(url, s, cookies_browser=""):
+        raise IngestError("AGE_RESTRICTED", "Video ini dibatasi umur. Isi pengaturan cookies_browser.")
+
+    monkeypatch.setattr(projects, "probe_youtube", boom)
+    r = client.post("/api/projects/probe", json={"url": VIDEO_URL})
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "AGE_RESTRICTED"
+
+
+def test_api_upload_with_ranges_rejected(client):
+    r = client.post("/api/projects/upload", files={"file": ("v.mp4", b"\x00" * 16, "video/mp4")},
+                    data={"ranges": "[[0, 60]]"})
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "VALIDATION"

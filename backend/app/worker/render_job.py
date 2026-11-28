@@ -11,8 +11,11 @@ from sqlmodel import Session
 
 from app.core.config import BACKEND_DIR, Settings, get_settings
 from app.core.errors import AppError
+from app.core.fs import read_json
+from app.core.models import VideoMeta
 from app.db.tables import Clip, Job, Project, utcnow
 from app.domain.clip_doc import to_clip_plan
+from app.domain.ranges import SourceMap
 from app.pipeline.render import render_clip
 from app.worker import queue
 from app.worker.process import to_app_error
@@ -76,10 +79,21 @@ def run_render_job(engine: Engine, job_id: str, render: Render = render_clip, *,
             if project is None:
                 raise AppError("VALIDATION", "Render klip kompilasi tersedia di S4")
             pdir = Path(settings.data_dir) / "projects" / project.id
-            source = pdir / "source.mp4"
+            plan, presets = to_clip_plan(clip, project.style or {})
+            meta_raw = read_json(pdir / "meta.json")
+            if meta_raw and meta_raw.get("ranges"):
+                smap = SourceMap.from_meta(VideoMeta.model_validate(meta_raw), pdir)
+                rf = smap.locate_span(plan.candidate.start, plan.candidate.end)
+                if rf is None:
+                    raise AppError("VALIDATION", "Bagian video ini belum diunduh (di luar rentang project).")
+                source = smap.path(rf)
+                ls = max(0.0, smap.to_local(rf, plan.candidate.start))
+                le = max(ls, smap.to_local(rf, plan.candidate.end))
+                plan = plan.model_copy(update={"candidate": plan.candidate.model_copy(update={"start": ls, "end": le})})
+            else:
+                source = pdir / "source.mp4"
             if not source.exists():
                 raise AppError("INVALID_STATE", "Video sumber sudah dihapus")
-            plan, presets = to_clip_plan(clip, project.style or {})
             duration = plan.candidate.end - plan.candidate.start
             out = render(source, plan, pdir / "clips" / clip.id, presets, FONTS_DIR,
                          on_progress=_progress_writer(engine, job_id, duration))

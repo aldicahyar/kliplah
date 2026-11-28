@@ -229,3 +229,89 @@ def test_e2e_api_worker_process_prepare_and_render(tmp_path, synthetic_video, mo
     worker_main(scratch, once=True)  # runs real run_render_job -> ffmpeg final.mp4
     done = clip_service.get_clip(eng, clips[0].id)
     assert done.status == "rendered" and done.output_path and Path(done.output_path).is_file()
+
+
+def test_prepare_reframes_range_file_with_local_times(engine, settings, monkeypatch):
+    from app.worker import prepare
+
+    with Session(engine) as s:
+        p = Project(youtube_url="https://youtu.be/dQw4w9WgXcQ", transcript_source="youtube_manual",
+                    target_language="id", ranges=[[1800, 1860], [3600, 3660]])
+        s.add(p)
+        s.commit()
+        pid = p.id
+    d = Path(settings.data_dir) / "projects" / pid
+    tdir = d / "transcripts" / "youtube-manual-id"
+    tdir.mkdir(parents=True)
+    (d / "source_r0.mp4").write_bytes(b"v0")
+    (d / "source_r1.mp4").write_bytes(b"v1")
+    t_base = make_transcript(12, each=5.0)
+    # 6 sentences in r0 (1800..1830), 6 in r1 (3600..3630)
+    words = []
+    sents = []
+    for i, sent in enumerate(t_base.sentences):
+        shift = 1800.0 if i < 6 else 3600.0 - 30.0
+        a, b = sent.word_range
+        for w in t_base.words[a:b]:
+            words.append(w.model_copy(update={"start": round(w.start + shift, 3), "end": round(w.end + shift, 3)}))
+        sents.append(sent.model_copy(update={"start": round(sent.start + shift, 3), "end": round(sent.end + shift, 3)}))
+    t = t_base.model_copy(update={"duration": 4000.0, "words": words, "sentences": sents})
+    (tdir / "transcript.json").write_text(t.model_dump_json(), encoding="utf-8")
+    (d / "silences.json").write_text("[]", encoding="utf-8")
+    ranges_meta = [
+        {"index": 0, "start": 1800.0, "end": 1860.0, "file": "source_r0.mp4"},
+        {"index": 1, "start": 3600.0, "end": 3660.0, "file": "source_r1.mp4"},
+    ]
+    meta = VideoMeta(source_type="youtube", project_id=pid, title="T", duration=4000.0,
+                     ranges=ranges_meta, transcript_source="youtube_manual")
+    (d / "meta.json").write_text(meta.model_dump_json(), encoding="utf-8")
+
+    seen_reframe, seen_thumbs, seen_proxies = [], [], []
+    monkeypatch.setattr(prepare, "reframe_clip", lambda src, a, b, models_dir=None: (
+        seen_reframe.append((src.name, a, b))
+        or ([ReframeSegment(start=0.0, end=round(b - a, 3), mode="track", x=0.5)], "face_crop")
+    ))
+    monkeypatch.setattr(prepare, "make_thumbnail", lambda src, tm, out: (
+        seen_thumbs.append((src.name, tm)), out.parent.mkdir(parents=True, exist_ok=True), out.write_bytes(b"j")
+    ))
+    monkeypatch.setattr(prepare, "make_proxy", lambda src, out: (
+        seen_proxies.append((src.name, out.name)), out.write_bytes(b"p")
+    ))
+
+    # One valid pick in r1 (3605..3625), one invalid pick crossing the gap (1820..3610)
+    prepare_project_clips(engine, pid, [_pick(3605.0, 3625.0, 90), _pick(1820.0, 3610.0, 50)], settings=settings)
+    clips = _clips(engine, pid)
+    assert len(clips) == 1
+    assert clips[0].pieces[0]["start"] >= 3600.0 and clips[0].pieces[0]["end"] <= 3660.0
+    assert seen_reframe and seen_reframe[0][0] == "source_r1.mp4"
+    assert 0.0 <= seen_reframe[0][1] < seen_reframe[0][2] <= 60.0
+    assert seen_thumbs and seen_thumbs[0][0] == "source_r1.mp4" and 0.0 <= seen_thumbs[0][1] <= 60.0
+    assert seen_proxies == [("source_r0.mp4", "proxy_r0.mp4"), ("source_r1.mp4", "proxy_r1.mp4")]
+
+
+def test_prepare_legacy_keeps_last_clip_ending_slightly_after_rounded_meta_duration(engine, settings):
+    with Session(engine) as s:
+        p = Project(youtube_url="https://youtu.be/dQw4w9WgXcQ")
+        s.add(p)
+        s.commit()
+        pid = p.id
+    d = Path(settings.data_dir) / "projects" / pid
+    tdir = d / "transcripts" / "small"
+    tdir.mkdir(parents=True)
+    (d / "source.mp4").write_bytes(b"v")
+    t = make_transcript(30, each=6.0)  # 0..180.0 base
+    # Last sentence and word extend 0.8 s past rounded integer meta.duration (180.0)
+    t.sentences[-1] = t.sentences[-1].model_copy(update={"end": 180.8})
+    t.words[-1] = t.words[-1].model_copy(update={"end": 180.8})
+    (tdir / "transcript.json").write_text(t.model_dump_json(), encoding="utf-8")
+    (d / "silences.json").write_text("[]", encoding="utf-8")
+    meta = VideoMeta(source_type="youtube", project_id=pid, title="Judul", duration=180.0)
+    (d / "meta.json").write_text(meta.model_dump_json(), encoding="utf-8")
+
+    media = FakeMedia()
+    deps = PrepareDeps(settings=settings, reframe=media.reframe, thumbnail=media.thumbnail)
+    ids = build_clips_from_picks(engine, pid, [_pick(150.0, 180.8, 90)], deps)
+    assert len(ids) == 1
+    [clip] = _clips(engine, pid)
+    assert clip.pieces[0]["end"] == pytest.approx(180.8, abs=0.1)
+    assert clip.pieces[0]["end"] > 180.5

@@ -14,12 +14,13 @@ from sqlmodel import Session, select
 
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
-from app.core.fs import read_json
-from app.core.models import PlatformCaption, Transcript
+from app.core.fs import project_dir, read_json
+from app.core.models import PlatformCaption, Transcript, VideoMeta
 from app.db.engine import session_scope
 from app.db.tables import Clip, Job, Project, utcnow
 from app.domain.clip_doc import Overlay, SubtitleLineV2, subtitles_from_m1
 from app.domain.layouts import LayoutSegment, normalize_layout_segments
+from app.domain.ranges import RangeFile, SourceMap
 from app.domain.style import effective_style, style_diff
 from app.domain.timeline import Piece, output_duration, output_to_source, remap_output_items
 from app.pipeline.subtitles import group_lines
@@ -146,7 +147,20 @@ def _validated_list(patch: dict, field: str, model: type[BaseModel]) -> list[dic
         return [model.model_validate(item).model_dump() for item in value]
 
 
-def _validated_pieces(patch: dict, clip: Clip, session: Session) -> list[dict]:
+def _check_piece_in_ranges(project: Project, start: float, end: float, settings: Settings) -> None:
+    pdir = project_dir(settings, project.id)
+    meta_raw = read_json(pdir / "meta.json")
+    smap: SourceMap | None = None
+    if meta_raw and meta_raw.get("ranges"):
+        smap = SourceMap.from_meta(VideoMeta.model_validate(meta_raw), pdir)
+    elif project.ranges:
+        files = [RangeFile(i, float(r[0]), float(r[1]), f"source_r{i}.mp4") for i, r in enumerate(project.ranges)]
+        smap = SourceMap(files, pdir)
+    if smap is not None and smap.locate_span(start, end) is None:
+        raise err("VALIDATION", "Bagian video ini belum diunduh (di luar rentang project).")
+
+
+def _validated_pieces(patch: dict, clip: Clip, session: Session, settings: Settings) -> list[dict]:
     pieces = _validated_list(patch, "pieces", Piece)
     if not pieces:
         raise err("VALIDATION", "Klip harus punya minimal satu potongan.")
@@ -158,6 +172,7 @@ def _validated_pieces(patch: dict, clip: Clip, session: Session) -> list[dict]:
             raise err("VALIDATION", f"Project {p['project_id']} pada potongan tidak ditemukan.")
         if project.duration_sec and p["end"] > project.duration_sec + _EPS:
             raise err("VALIDATION", "Akhir potongan melewati durasi video.")
+        _check_piece_in_ranges(project, p["start"], p["end"], settings)
     return pieces
 
 
@@ -209,7 +224,7 @@ def patch_clip(engine: Engine, clip_id: str, patch: dict, *, settings: Settings 
             if field in patch:
                 new[field] = _validated_list(patch, field, model)
         if "pieces" in patch:
-            new["pieces"] = _validated_pieces(patch, clip, s)
+            new["pieces"] = _validated_pieces(patch, clip, s, settings)
 
         pieces_changed = new["pieces"] != before["pieces"]
         new_p = [Piece.model_validate(p) for p in new["pieces"]]
@@ -336,6 +351,7 @@ def create_manual(engine: Engine, project_id: str, start: float, end: float, *,
             piece = Piece(project_id=project_id, start=start, end=end)
         if project.duration_sec and piece.end > project.duration_sec + _EPS:
             raise err("VALIDATION", "Akhir klip melewati durasi video.")
+        _check_piece_in_ranges(project, piece.start, piece.end, settings)
         t = _transcript_loader(s, settings)(project_id)
         if t is None:
             raise err("INVALID_STATE", "Transkrip tidak ditemukan; proses ulang project ini.")

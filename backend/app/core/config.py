@@ -1,3 +1,4 @@
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -5,6 +6,16 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 REPO_DIR = BACKEND_DIR.parent
+RANGE_MAX_HEIGHTS = (480, 720, 1080)
+DEFAULT_RANGE_MAX_HEIGHT = 720
+
+
+def cpu_count() -> int:
+    return max(1, os.cpu_count() or 1)
+
+
+def default_encode_threads() -> int:
+    return max(1, cpu_count() - 2)
 
 
 class Settings(BaseSettings):

@@ -2,7 +2,9 @@ import json
 from pathlib import Path
 
 from app.core.models import Word
-from app.pipeline.transcribe import chunk_bounds, transcribe
+from app.domain.ranges import RangeFile
+from app.pipeline.transcribe import chunk_bounds, merge_range_transcripts, transcribe
+from tests.helpers import W
 
 
 class FakeTranscriber:
@@ -58,3 +60,38 @@ def test_progress_reported(tmp_path):
     seen = []
     transcribe(Path("a.wav"), 1200, tmp_path, FakeTranscriber(), "small", [], on_progress=seen.append)
     assert seen == [0.5, 1.0]
+
+
+def test_transcribe_language_param(tmp_path):
+    t = transcribe(Path("a.wav"), 600, tmp_path, FakeTranscriber(), "small", [], language="en")
+    assert t.language == "en"
+
+
+def _rf(index, start, end):
+    return RangeFile(index, start, end, f"source_r{index}.mp4")
+
+
+def test_merge_range_transcripts_shifts_to_original_timeline():
+    words = [Word(w="halo.", start=0.5, end=0.9, prob=0.8)]
+    t = merge_range_transcripts([(_rf(0, 1800.0, 1830.0), words)], 2.0, "id", 7200.0)
+    assert (t.words[0].start, t.words[0].end, t.words[0].prob) == (1800.5, 1800.9, 0.8)
+    assert t.sentences[0].start == 1800.5 and t.sentences[0].word_range == (0, 1)
+    assert t.language == "id" and t.duration == 7200.0
+
+
+def test_transcript_never_spans_two_ranges():
+    """Adjacent ranges, no punctuation, no long pause across the seam: sentences still break at the seam."""
+    r0, r1 = _rf(0, 100.0, 110.0), _rf(1, 111.0, 121.0)
+    w0 = W("jadi gini aku mau cerita soal kerja", start=7.5)  # local 7.5..9.55 -> 107.5..109.55
+    w1 = W("terus dia bilang oke aja gitu", start=0.0)  # local 0 -> 111.0, gap 1.45 s < 2.0 s
+    t = merge_range_transcripts([(r0, w0), (r1, w1)], 2.0, "id", 300.0)
+    seam = len(w0)
+    assert len(t.words) == len(w0) + len(w1)
+    assert len(t.sentences) == 2
+    for s in t.sentences:
+        a, b = s.word_range
+        assert b <= seam or a >= seam
+        assert (t.words[a].start, t.words[b - 1].end) == (s.start, s.end)
+    assert [s.i for s in t.sentences] == [0, 1]
+    assert t.sentences[-1].word_range == (seam, len(t.words))
+    assert t.words[seam].start == 111.0

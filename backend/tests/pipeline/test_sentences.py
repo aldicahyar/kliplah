@@ -36,3 +36,10 @@ def test_word_range_and_times_consistent():
 
 def test_empty_words():
     assert split_sentences([]) == []
+
+
+def test_split_sentences_custom_pause():
+    a = W("jadi gini aku")
+    b = W("mau cerita", start=a[-1].end + 1.2)
+    assert len(split_sentences(a + b)) == 1
+    assert [s.text for s in split_sentences(a + b, pause_sec=1.0)] == ["jadi gini aku", "mau cerita"]

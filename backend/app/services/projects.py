@@ -12,7 +12,9 @@ from app.core.config import Settings, get_settings
 from app.db.engine import session_scope
 from app.db.tables import Clip, Job, Project, StyleTemplate, utcnow
 from app.domain.profiles import profile_for
-from app.pipeline.ingest import IngestError, parse_youtube_id
+from app.domain.ranges import normalize_ranges
+from app.pipeline.ingest import IngestError, parse_youtube_id, probe_youtube
+from app.pipeline.youtube_subs import TRANSCRIPT_SOURCES, resolve_transcript_source
 from app.services import styles
 from app.services._common import domain_errors, err, fetch
 from app.services.settings_store import MOMENT_SOURCES, get_app_settings
@@ -20,6 +22,8 @@ from app.worker import queue
 
 UPDATABLE = ("style", "facecam_box", "keep_source", "content_type")
 FACECAM_LAYOUTS = ("facecam_gameplay", "facecam_full")
+# Perkiraan rasio waktu encode ulang rentang (ultrafast 720p di CPU laptop, bukan hasil ukur pasti)
+ENCODE_FACTOR = 0.35
 
 
 def _content_profile(content_type: str):
@@ -39,6 +43,45 @@ def _upload_filename(upload_path: Path, original_filename: str | None) -> str:
     if not name or name in (".", ".."):
         raise err("VALIDATION", "Nama file unggahan tidak valid.")
     return name
+
+
+def probe(engine: Engine, url: str, *, ranges: list | None = None, target_language: str = "id",
+          settings: Settings | None = None) -> dict:
+    """Inspect a YouTube link without downloading: metadata, subtitle/chat flags, resource estimates, warnings."""
+    settings = settings or get_settings()
+    with session_scope(engine) as s:
+        cookies_browser = get_app_settings(s, settings=settings)["cookies_browser"]
+    try:
+        meta = probe_youtube(url, settings, cookies_browser=cookies_browser)
+    except IngestError as e:
+        raise err(e.code, str(e)) from e
+    norm = normalize_ranges(ranges, meta.duration or None)
+    effective_dur = sum(e - s for s, e in norm) if norm else meta.duration
+    auto_source = resolve_transcript_source("auto", meta, target_language)
+    video_rate = 0.6 * 1024**2 if norm else 1.5 * 1024**2
+    disk_bytes = effective_dur * (video_rate + 32 * 1024)
+    disk_gb = round(disk_bytes / 1024**3, 1)
+    whisper_sec = effective_dur * 0.5 if auto_source == "whisper" else 0.0
+    download_sec = (effective_dur / 3600.0) * 120.0
+    encode_sec = effective_dur * ENCODE_FACTOR if norm else 0.0
+    total_sec = whisper_sec + download_sec + encode_sec
+    process_minutes = max(1, round(total_sec / 60.0)) if effective_dur > 0 else 0
+    warnings: list[str] = []
+    if effective_dur > 7200:
+        warnings.append("Durasi video lebih dari 2 jam; pilih rentang waktu atau sumber transkrip youtube_auto "
+                        "agar proses lebih cepat dan hemat ruang disk.")
+    return {
+        "title": meta.title,
+        "channel": meta.channel,
+        "duration": meta.duration,
+        "chapters": meta.chapters,
+        "has_heatmap": bool(meta.heatmap),
+        "subtitles": meta.subtitles or {"manual": [], "auto": []},
+        "has_live_chat": meta.has_live_chat,
+        "transcript_source_auto": auto_source,
+        "estimate": {"process_minutes": process_minutes, "disk_gb": disk_gb},
+        "warnings": warnings,
+    }
 
 
 def create_project(engine: Engine, *, url: str | None = None, upload_path: Path | None = None,
@@ -73,6 +116,12 @@ def create_project(engine: Engine, *, url: str | None = None, upload_path: Path 
         raise err("VALIDATION", "Durasi maksimal klip tidak boleh lebih kecil dari durasi minimal.")
     if moment_source is not None and moment_source not in MOMENT_SOURCES:
         raise err("VALIDATION", f"Sumber momen harus salah satu dari: {', '.join(MOMENT_SOURCES)}.")
+    if transcript_source not in TRANSCRIPT_SOURCES:
+        raise err("VALIDATION", f"Sumber transkrip harus salah satu dari: {', '.join(TRANSCRIPT_SOURCES)}.")
+    norm_ranges = normalize_ranges(ranges, None)
+    if upload_path is not None and norm_ranges is not None:
+        raise err("VALIDATION", "Rentang untuk file unggahan belum didukung.")
+    stored_ranges = [[s, e] for s, e in norm_ranges] if norm_ranges else None
     if max_clips is not None:
         _check_positive_int("max_clips", max_clips)
 
@@ -93,7 +142,7 @@ def create_project(engine: Engine, *, url: str | None = None, upload_path: Path 
         project = Project(
             id=project_id, source_type="youtube" if url is not None else "upload",
             youtube_url=url.strip() if url is not None else None, video_id=video_id, original_filename=filename,
-            content_type=resolved_type, ranges=copy.deepcopy(ranges), focus_prompt=focus_prompt,
+            content_type=resolved_type, ranges=stored_ranges, focus_prompt=focus_prompt,
             target_language=target_language, transcript_source=transcript_source,
             moment_source=moment_source or app["moment_source"],
             max_clips=max_clips if max_clips is not None else app["max_clips"],

@@ -223,3 +223,38 @@ def test_reject_cancels_queued_render_job(engine, make_clip):
     clips.approve(engine, clip.id)
     clips.reject(engine, clip.id)
     assert [j.status for j in _render_jobs(engine)] == ["cancelled"]
+
+
+def test_patch_piece_outside_ranges_rejected(engine, settings, ready_project, make_clip):
+    from app.core.models import VideoMeta
+
+    project, _ = ready_project
+    with Session(engine) as s:
+        row = s.get(Project, project.id)
+        row.duration_sec = 300.0
+        row.ranges = [[0.0, 30.0], [100.0, 150.0]]
+        s.add(row)
+        s.commit()
+    pdir = settings.data_dir / "projects" / project.id
+    meta = VideoMeta(
+        source_type="youtube", project_id=project.id, title="T", duration=300.0,
+        ranges=[{"index": 0, "start": 0.0, "end": 30.0, "file": "source_r0.mp4"},
+                {"index": 1, "start": 100.0, "end": 150.0, "file": "source_r1.mp4"}],
+    )
+    (pdir / "meta.json").write_text(meta.model_dump_json(), encoding="utf-8")
+
+    clip = make_clip(5.0, 15.0)
+    for bad in ((40.0, 50.0), (20.0, 110.0)):
+        with pytest.raises(AppError) as e:
+            clips.patch_clip(engine, clip.id, {"pieces": [{"project_id": project.id, "start": bad[0], "end": bad[1]}]},
+                             settings=settings)
+        assert e.value.code == "VALIDATION" and e.value.status == 422
+        assert e.value.message == "Bagian video ini belum diunduh (di luar rentang project)."
+
+        with pytest.raises(AppError) as e2:
+            clips.create_manual(engine, project.id, bad[0], bad[1], settings=settings)
+        assert e2.value.code == "VALIDATION" and e2.value.status == 422
+        assert e2.value.message == "Bagian video ini belum diunduh (di luar rentang project)."
+
+    ok = clips.create_manual(engine, project.id, 105.0, 120.0, settings=settings)
+    assert ok.pieces == [{"project_id": project.id, "start": 105.0, "end": 120.0}]

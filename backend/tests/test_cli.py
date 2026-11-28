@@ -484,3 +484,60 @@ def test_export_transcript_queue_only_points_to_export_moments(env, capsys):
 def test_export_moments_unknown_project_exit_code(env, capsys):
     assert cli.main(["export-moments", "tidak-ada"]) == 2
     assert "[NOT_FOUND]" in capsys.readouterr().out
+
+
+def test_cli_run_with_range_and_focus(env):
+    settings, _ = env
+    assert cli.main([
+        "run", URL, "--range", "00:30:00-01:00:00", "--focus", "reaksi kaget",
+        "--transcript-source", "whisper", "--moments", "ollama", "--no-render",
+    ]) == 0
+    [p] = _projects(settings)
+    assert p.ranges == [[1800.0, 3600.0]]
+    assert p.focus_prompt == "reaksi kaget"
+    assert p.transcript_source == "whisper"
+
+
+def test_cli_config_set_cookies_browser(env, capsys):
+    settings, _ = env
+    assert cli.main(["config", "set", "cookies_browser", "chrome"]) == 0
+    assert cli.main(["config", "get", "cookies_browser"]) == 0
+    assert "chrome" in capsys.readouterr().out
+    assert cli.main(["config", "set", "cookies_browser", "safari"]) == 2
+
+
+def test_cli_config_set_encode_threads_and_range_max_height(env, monkeypatch, capsys):
+    import os
+
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    assert cli.main(["config", "set", "encode_threads", "4"]) == 0
+    assert cli.main(["config", "get", "encode_threads"]) == 0
+    assert "encode_threads=4" in capsys.readouterr().out
+    assert cli.main(["config", "set", "encode_threads", "0"]) == 2
+    assert cli.main(["config", "set", "encode_threads", "abc"]) == 2
+
+    assert cli.main(["config", "set", "range_max_height", "480"]) == 0
+    assert cli.main(["config", "get", "range_max_height"]) == 0
+    assert "range_max_height=480" in capsys.readouterr().out
+    assert cli.main(["config", "set", "range_max_height", "360"]) == 2
+    assert cli.main(["config", "set", "range_max_height", "abc"]) == 2
+
+
+def test_cli_probe_prints_estimate(env, monkeypatch, capsys):
+    from app.services import projects
+
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": VideoMeta(
+        source_type="youtube", project_id="vid12345678", title="Stream Panjang", channel="Ch",
+        duration=31380.0, video_id="vid12345678", subtitles={"manual": [], "auto": ["id"]},
+        has_live_chat=True,
+    ))
+    assert cli.main(["probe", URL, "--range", "00:30:00-01:00:00"]) == 0
+    out = capsys.readouterr().out
+    assert "Stream Panjang" in out and "26" in out
+
+
+def test_cli_age_restricted_exit_code_2(env, capsys):
+    _, pipe = env
+    pipe.ingest_error = IngestError("AGE_RESTRICTED", "Video ini dibatasi umur.")
+    assert cli.main(["run", URL, "--moments", "ollama"]) == 2
+    assert "[AGE_RESTRICTED]" in capsys.readouterr().out

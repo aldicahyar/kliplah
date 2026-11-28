@@ -191,3 +191,80 @@ def test_render_job_real_ffmpeg(engine, settings, synthetic_video):
                           "stream=width,height", "-of", "json", str(final)], capture_output=True, text=True)
     stream = json.loads(out.stdout)["streams"][0]
     assert (stream["width"], stream["height"]) == (1080, 1920)
+
+
+def test_render_uses_range_file_and_local_times(engine, settings):
+    from app.core.models import VideoMeta
+
+    pid, cid, jid = _setup(engine, settings, pieces=[{"project_id": "placeholder", "start": 1805.0, "end": 1812.0}])
+    with Session(engine) as s:
+        clip = s.get(Clip, cid)
+        clip.pieces = [{"project_id": pid, "start": 1805.0, "end": 1812.0}]
+        clip.layout_segments = [{"start": 0.0, "end": 7.0, "layout": "fit_blur"}]
+        s.add(clip)
+        s.commit()
+    pdir = Path(settings.data_dir) / "projects" / pid
+    (pdir / "source_r1.mp4").write_bytes(b"v1")
+    meta = VideoMeta(
+        source_type="youtube", project_id=pid, title="T", duration=3600.0,
+        ranges=[{"index": 0, "start": 0.0, "end": 100.0, "file": "source_r0.mp4"},
+                {"index": 1, "start": 1800.0, "end": 1900.0, "file": "source_r1.mp4"}],
+    )
+    (pdir / "meta.json").write_text(meta.model_dump_json(), encoding="utf-8")
+
+    fake = FakeRender()
+    run_render_job(engine, jid, render=fake, settings=settings)
+    source, plan, _, _, _ = fake.calls[0]
+    assert source == pdir / "source_r1.mp4"
+    assert (plan.candidate.start, plan.candidate.end) == (5.0, 12.0)
+    assert plan.subtitles[0].start == 0.5 and plan.subtitles[0].end == 2.0
+
+
+def test_render_legacy_project_still_works(engine, settings):
+    from app.core.models import VideoMeta
+
+    pid, cid, jid = _setup(engine, settings)
+    pdir = Path(settings.data_dir) / "projects" / pid
+    (pdir / "meta.json").write_text(
+        VideoMeta(source_type="youtube", project_id=pid, title="T", duration=120.0).model_dump_json(),
+        encoding="utf-8",
+    )
+    fake = FakeRender()
+    run_render_job(engine, jid, render=fake, settings=settings)
+    source, plan, _, _, _ = fake.calls[0]
+    assert source == pdir / "source.mp4"
+    assert (plan.candidate.start, plan.candidate.end) == (2.0, 8.0)
+    assert _get(engine, Clip, cid).status == "rendered"
+
+
+@pytest.mark.slow
+def test_render_range_project_real_ffmpeg(engine, settings, synthetic_video):
+    from app.core.models import VideoMeta
+
+    pid, cid, jid = _setup(engine, settings)
+    with Session(engine) as s:
+        clip = s.get(Clip, cid)
+        clip.pieces = [{"project_id": pid, "start": 105.0, "end": 112.0}]
+        clip.layout_segments = [{"start": 0.0, "end": 7.0, "layout": "fit_blur"}]
+        s.add(clip)
+        s.commit()
+    pdir = Path(settings.data_dir) / "projects" / pid
+    shutil.copy(synthetic_video, pdir / "source_r0.mp4")
+    shutil.copy(synthetic_video, pdir / "source_r1.mp4")
+    meta = VideoMeta(
+        source_type="youtube", project_id=pid, title="T", duration=300.0,
+        ranges=[{"index": 0, "start": 0.0, "end": 20.0, "file": "source_r0.mp4"},
+                {"index": 1, "start": 100.0, "end": 120.0, "file": "source_r1.mp4"}],
+    )
+    (pdir / "meta.json").write_text(meta.model_dump_json(), encoding="utf-8")
+
+    run_render_job(engine, jid, settings=settings)
+    job = _get(engine, Job, jid)
+    assert job.status == "succeeded", job.error_message
+    final = pdir / "clips" / cid / "final.mp4"
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=width,height:format=duration",
+                          "-of", "json", str(final)], capture_output=True, text=True, check=True)
+    info = json.loads(out.stdout)
+    stream = next(s for s in info["streams"] if s.get("width"))
+    assert (stream["width"], stream["height"]) == (1080, 1920)
+    assert float(info["format"]["duration"]) == pytest.approx(7.0, abs=1.0)
