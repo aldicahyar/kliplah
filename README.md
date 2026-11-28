@@ -2,20 +2,21 @@
 
 Aplikasi pribadi yang mengubah video panjang dari YouTube atau file lokal (podcast, stream, variety show, berita) menjadi klip vertikal 9:16 lengkap dengan hook dan subtitle, siap diunggah ke TikTok, Instagram Reels, dan YouTube Shorts. Semua proses berjalan **lokal** di laptop, tanpa GPU dan tanpa API berbayar. Momen menarik dipilih oleh Claude lewat langganan Anda sendiri (default) atau oleh model lokal lewat Ollama.
 
-Status: **S2 selesai (uji video asli menyusul): API + worker + input & sinyal.** Backend sudah mendukung `probe`, unduhan per rentang waktu, cookies browser, subtitle resmi/otomatis YouTube sebagai sumber transkrip, sinyal live chat + puncak suara, arahan `focus_prompt`, profil konten, dan model data v2. Website (review dan edit klip di browser) menyusul setelah tahap sistem S3–S4.
+Status: **S3 selesai (uji video asli menyusul): bahasa asing, terjemahan, & subtitle dua bahasa.** Backend sudah mendukung `probe`, unduhan per rentang waktu, cookies browser, subtitle YouTube lintas bahasa, Whisper multibahasa dengan deteksi bahasa otomatis dan keyakinan per kata (`prob`), terjemahan Indonesia lewat Ollama atau Claude manual (`export-translation` / `import-translation`), mode tampilan subtitle (`target`, `bilingual`, `original`), sinyal live chat + puncak suara, arahan `focus_prompt`, profil konten, dan model data v2. Website (review dan edit klip di browser) menyusul setelah tahap sistem S4.
 
 ## Cara kerja singkat
 
 ```text
-link YouTube / file video (+ opsional: --range, --focus, --transcript-source)
-  -> probe (durasi, subtitle, live chat, perkiraan disk & waktu)
+link YouTube / file video (+ opsional: --range, --focus, --source-language, --target-language, --transcript-source)
+  -> probe (durasi, subtitle, live chat, hint bahasa, rencana subtitle, perkiraan disk & waktu)
   -> unduh (yt-dlp penuh 1080p tanpa encode ulang, atau per rentang maks 720p + encode cepat ke source_r<i>.mp4, opsional cookies_browser)
-  -> audio & jeda + transkrip (subtitle YouTube json3 atau faster-whisper CPU per 10 menit)
+  -> audio & jeda + transkrip (urutan auto: subtitle resmi target -> source_language -> en -> abjad pertama -> faster-whisper CPU multibahasa)
+  -> terjemah (tahap translate ke translation.json bila bahasa sumber != target dan mode Ollama; untuk Claude manual, klip terpilih diterjemahkan lewat lines / export-translation)
   -> sinyal (heatmap, puncak live chat, puncak suara ebur128)
   -> pilih momen: Claude manual (default, project menunggu balasan Anda)
-                  atau Ollama qwen3:4b (otomatis, profil konten + focus_prompt + bonus sinyal)
-  -> rapikan batas klip (kata -> kalimat -> jeda), crop 9:16 per adegan (MediaPipe), thumbnail, proxy
-  -> setujui klip -> render (hook + subtitle tertanam, volume -14 LUFS)
+                  atau Ollama qwen3:4b (otomatis, memakai teks terjemahan bila asing + profil konten + focus_prompt + bonus sinyal)
+  -> rapikan batas klip (kata -> kalimat -> jeda), crop 9:16 per adegan (MediaPipe), subtitle dua bahasa (text + text_original), thumbnail, proxy
+  -> setujui klip -> render (hook + subtitle tertanam sesuai language_mode, volume -14 LUFS)
 ```
 
 ## Persiapan (Windows)
@@ -57,7 +58,7 @@ curl.exe http://127.0.0.1:8000/api/projects/<project_id>/clips    # daftar klip
 curl.exe -X POST http://127.0.0.1:8000/api/clips/<clip_id>/approve # setujui -> render
 ```
 
-Endpoint lain: cek link sebelum proses (`POST /api/projects/probe`), unggah file (`POST /api/projects/upload`), edit klip (`PATCH /api/clips/{id}`), aksi massal (`POST /api/clips/bulk`), template gaya (`/api/style-templates`), pengaturan (`/api/system/settings`, termasuk `cookies_browser`, `encode_threads`, `range_max_height`), dan status sistem (`GET /api/system/health`). Daftar lengkapnya ada di `/docs`.
+Endpoint lain: cek link sebelum proses (`POST /api/projects/probe`), unggah file (`POST /api/projects/upload`), ekspor/impor terjemahan Claude (`GET /api/projects/{id}/translation-export`, `POST /api/projects/{id}/translation-import`), edit klip (`PATCH /api/clips/{id}`), aksi massal (`POST /api/clips/bulk`), template gaya (`/api/style-templates`), daftar bahasa (`GET /api/system/languages`), pengaturan (`/api/system/settings`, termasuk `cookies_browser`, `encode_threads`, `range_max_height`), dan status sistem (`GET /api/system/health`). Daftar lengkapnya ada di `/docs`.
 
 ## Memilih momen dengan Claude (default, tanpa biaya API, tanpa Ollama)
 
@@ -88,16 +89,42 @@ curl.exe -X POST http://127.0.0.1:8000/api/projects/<project_id>/moments-finish 
 
 Untuk memakai Ollama sebagai default, ubah pengaturan: `PUT /api/system/settings` dengan `{"moment_source": "ollama"}`, atau per perintah CLI dengan `--moments ollama`.
 
+## Video berbahasa asing dan terjemahan
+
+- **Deteksi dan pilihan bahasa (`--source-language` / `source_language`):** kosong/`auto` (default) membuat Whisper mendeteksi bahasa dari potongan audio pertama yang memiliki ≥ 10 kata. Hasil deteksi Melayu (`ms`) dianggap bahasa target Indonesia (`id`), dan keyakinan `< 0,6` otomatis kembali ke bahasa target. Setiap kata menyimpan keyakinan `prob`. Daftar 19 kode bahasa tersedia di `GET /api/system/languages`.
+- **Urutan sumber subtitle (`--transcript-source auto`):** untuk YouTube, `auto` memilih subtitle resmi (`youtube_manual`) dengan urutan prioritas: bahasa target (`id`) → `source_language` (jika diisi dan tersedia) → `en` → bahasa pertama menurut abjad. Jika tidak ada subtitle resmi, otomatis memakai `whisper`. `youtube_auto` tidak pernah dipilih otomatis dan hanya dipakai bila dipilih eksplisit (`--transcript-source youtube_auto`). File unggahan lokal selalu memakai `whisper`.
+- **Contoh bahasa asing dengan Claude** *(dianjurkan untuk Korea, Jepang, Mandarin, Thailand)*:
+  ```powershell
+  uv run python -m app.cli run "https://www.youtube.com/watch?v=..." --source-language ko --moments claude
+  ```
+  Claude membaca transkrip bahasa asli di `untuk_claude*.md`, menulis hook/alasan/judul/caption/hashtag dalam bahasa Indonesia, dan diminta menyertakan field `"lines": [{"n": ..., "text": "..."}]` untuk kalimat di sekitar klip terpilih (`start_sentence - 1` sampai `end_sentence + 1`). Saat diimpor, terjemahan `lines` langsung disimpan ke `translation.json` (balasan tanpa `lines` tetap diterima dan bisa diterjemahkan lewat langkah di bawah).
+- **Alur terjemahan manual terpisah (`export-translation` / `import-translation`):** dipakai bila balasan momen belum menyertakan `lines`, masih ada kalimat klip yang belum diterjemahkan, atau ingin menerjemahkan seluruh transkrip:
+  ```powershell
+  uv run python -m app.cli export-translation <project_id>                      # default --scope clips (atau --scope all)
+  # Berikan isi terjemahan_claude*.md ke Claude, simpan JSON balasannya ke terjemahan.json
+  uv run python -m app.cli import-translation <project_id> terjemahan.json      # tambah --part 2 bila > 300 baris
+  ```
+  Lewat API: `GET /api/projects/<project_id>/translation-export?scope=clips` lalu `POST /api/projects/<project_id>/translation-import?part=1` (body teks mentah UTF-8). Impor memperbarui `translation.json` dan menyegarkan subtitle klip yang belum diedit manual (klip yang sudah dirender ditandai `needs_rerender`; klip dengan baris `edited` dilewati).
+- **Mode Ollama (`--moments ollama`):** bila bahasa sumber berbeda dari target, tahap `translate` menerjemahkan transkrip dalam batch 40 kalimat ke `translation.json` (dengan checkpoint per batch) sebelum analisis momen. Untuk `ko`, `ja`, `zh`, dan `th`, `probe` memberi peringatan agar mempertimbangkan jalur Claude manual.
+- **Mode tampilan subtitle (`subtitle.language_mode`):** diatur lewat gaya project (`PATCH /api/projects/{id}`) atau per klip (`PATCH /api/clips/{id}` pada `style_override`):
+  - `target` *(default)*: hanya menampilkan teks target (Indonesia).
+  - `bilingual`: menampilkan teks asli (`text_original`) di atas teks terjemahan dengan skala ukuran font `0,72×`.
+  - `original`: menampilkan teks bahasa asli (`text_original`, atau fallback ke `text` bila kosong).
+  Mode **Sorot kata** (`highlight_word`) otomatis turun menjadi tampilan per baris jika kata berwaktu perkiraan (`approx: true`) atau `language_mode` bukan `target`.
+
 ## Perintah CLI lain
 
 ```powershell
 cd backend
-uv run python -m app.cli probe "https://www.youtube.com/watch?v=..." --range 00:30:00-01:00:00
+uv run python -m app.cli probe "https://www.youtube.com/watch?v=..." --type stream --source-language en --range 00:30:00-01:00:00
 uv run python -m app.cli config set cookies_browser chrome                       # untuk video dibatasi umur
 uv run python -m app.cli config set encode_threads 4                             # jumlah thread CPU saat encode rentang
 uv run python -m app.cli config set range_max_height 720                         # resolusi maks rentang (480/720/1080)
 uv run python -m app.cli run "https://www.youtube.com/watch?v=..." --type stream --range 05:20:00-05:50:00 --focus "reaksi pertama masuk dunia GTA 6" --moments ollama --no-render
+uv run python -m app.cli run "https://www.youtube.com/watch?v=..." --source-language ko --moments claude --no-render
 uv run python -m app.cli run "D:\rekaman\episode1.mp4" --moments ollama --no-render
+uv run python -m app.cli export-translation <project_id> --scope clips
+uv run python -m app.cli import-translation <project_id> terjemahan.json --part 1
 uv run python -m app.cli analyze <project_id> --llm-model gemma3:4b              # pilih momen ulang dengan Ollama
 uv run python -m app.cli bench-whisper "<link atau file>" --models small medium --seconds 300
 uv run python -m app.cli migrate-m1    # pindahkan hasil CLI M1 lama ke database (sekali, aman diulang)
@@ -112,6 +139,11 @@ CLI menulis ke database yang sama dengan API, dan tanpa opsi tambahan menjalanka
 - **`recover` hanya untuk saat tidak ada worker yang berjalan.** Perintah ini mengembalikan job `running` dan klip `rendering` yang tertinggal (misalnya karena laptop mati) ke antrean. Jika dijalankan saat `dev.py` aktif, job yang sedang dikerjakan worker ikut dianggap tertinggal. Worker sendiri melakukan pemulihan ini otomatis setiap kali menyala.
 
 Hasil render ada di `DATA_DIR/projects/<id>/clips/<clip_id>/`: `final.mp4` dan `captions.txt` (judul, caption, dan hashtag per platform). Semua tahap menyimpan checkpoint, jadi proses yang terhenti (laptop mati, Ollama tertutup) dilanjutkan dari tahap terakhir. Error sementara diulang otomatis sampai 3 kali.
+
+## Batas yang diketahui
+
+- **Transkrip campuran bahasa:** satu project memakai satu bahasa sumber (`source_language`), misalnya video berbahasa Indonesia yang menyelipkan frasa atau kalimat Inggris. Perbaikan kata/baris lewat kamus koreksi dan editor subtitle di browser ditunda ke W2.
+- **Uji video asli S3 (Step 4):** verifikasi end-to-end memakai video berbahasa Inggris asli serta kalibrasi konstanta perkiraan terjemahan (`TRANSLATE_SEC_PER_MIN`) masih menunggu video contoh dari pengguna.
 
 ## Pengujian
 
