@@ -436,3 +436,10 @@ def test_finish_moments_without_lines_still_works(engine, settings):
     assert len(load_picks(settings.data_dir / "projects" / pid / "picks.json")) == 2
     assert not (tdir / "translation.json").exists()
 
+
+def test_collect_translation_lines_ignores_empty_duplicate_n():
+    assert collect_translation_lines([
+        {"lines": [{"n": 0, "text": "Halo"}, {"n": 1, "text": "   "}]},
+        {"lines": [{"n": 0, "text": "   "}, {"n": 0, "text": ""}]},
+    ]) == {0: "Halo"}
+

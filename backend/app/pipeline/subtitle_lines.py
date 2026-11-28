@@ -38,8 +38,8 @@ def clip_subtitle_lines(
     m1_lines = group_lines(view.words, start, end, max_words=max_words)
     dicts = subtitles_from_m1(m1_lines)
     for line, item in zip(m1_lines, dicts):
-        line_start = start + line.start
-        line_end = start + line.end
+        line_start = round(start + line.start, 3)
+        line_end = round(start + line.end, 3)
         if _has_translated_overlap(t.sentences, tr, line_start, line_end):
             item["source"] = "translated"
             item["text_original"] = original_text_between(t, line_start, line_end) or None

@@ -5,7 +5,7 @@ import pytest
 from app.core.errors import AppError
 from app.core.models import SubtitleLine, Word
 from app.db.tables import Clip
-from app.domain.clip_doc import Overlay, SubtitleLineV2, subtitles_from_m1, to_clip_plan
+from app.domain.clip_doc import Overlay, SubtitleLineV2, WordV2, _m1_line, subtitles_from_m1, to_clip_plan
 from app.domain.style import deep_merge, default_style
 from app.domain.timeline import Piece, output_duration
 from app.pipeline.subtitles import build_ass, load_presets
@@ -292,3 +292,20 @@ def test_language_mode_no_longer_warned_as_ignored(caplog, lang_mode):
     with caplog.at_level(logging.WARNING, logger="app.domain.clip_doc"):
         to_clip_plan(make_clip(style_override={"subtitle": {"language_mode": lang_mode}}), default_style())
     assert caplog.records == []
+
+
+def test_highlight_mode_falls_back_for_translated_source_even_when_words_not_approx():
+    line = SubtitleLineV2(
+        id=1,
+        start=0.2,
+        end=1.4,
+        text="halo semua",
+        source="translated",
+        text_original="hello everyone",
+        words=[
+            WordV2(w="halo", start=0.2, end=0.8, approx=False),
+            WordV2(w="semua", start=0.8, end=1.4, approx=False),
+        ],
+    )
+    m1 = _m1_line(line, uppercase=False, language_mode="target")
+    assert m1.words == []

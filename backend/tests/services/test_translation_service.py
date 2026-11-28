@@ -423,3 +423,27 @@ def test_import_translation_fallback_without_manifest_and_unchanged_rerender(eng
     with Session(engine) as s:
         assert s.get(Clip, cid).needs_rerender is False
 
+
+def test_refresh_skips_rendering_clips(engine, settings):
+    t = _english_transcript(4, each=6.0)
+    pid, tdir = _setup_project(engine, settings, t, transcript_source="whisper")
+    save_translation(
+        tdir,
+        Translation(language="id", source_language="en", lines={"0": "terjemahan nol"}),
+    )
+    orig_subs = clip_subtitle_lines(t, None, 0.0, 6.0, max_words=4, source="whisper")
+    cid_rendering = _add_clip(
+        engine, pid, [{"project_id": pid, "start": 0.0, "end": 6.0}], orig_subs, rank=1, status="rendering"
+    )
+    cid_ready = _add_clip(
+        engine, pid, [{"project_id": pid, "start": 0.0, "end": 6.0}], orig_subs, rank=2, status="proposed"
+    )
+
+    refreshed, skipped = refresh_clip_subtitles(engine, pid, settings=settings)
+    assert refreshed == [cid_ready]
+    assert skipped == [cid_rendering]
+    with Session(engine) as s:
+        c_rendering = s.get(Clip, cid_rendering)
+        assert c_rendering.subtitles == orig_subs
+        assert c_rendering.needs_rerender is False
+

@@ -107,8 +107,9 @@ def build_ass(lines: list[SubtitleLine], hook: str, hook_duration: float, preset
     hl = p.get("highlight")
     orig_size = max(1, round(p["size"] * ORIGINAL_FONT_SCALE))
     for line in lines:
-        if line.original:
-            body = f"{{\\fs{orig_size}}}{sanitize_ass_text(line.original)}{{\\r}}\\N{sanitize_ass_text(line.text)}"
+        orig_text = sanitize_ass_text(line.original).strip() if line.original else ""
+        if orig_text:
+            body = f"{{\\fs{orig_size}}}{orig_text}{{\\r}}\\N{sanitize_ass_text(line.text)}"
             out.append(f"Dialogue: 0,{_ts(line.start)},{_ts(line.end)},Sub,,0,0,0,,{body}")
             continue
         if not hl or line.edited or not line.words:

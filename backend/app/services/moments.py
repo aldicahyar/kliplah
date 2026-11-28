@@ -190,7 +190,7 @@ def collect_translation_lines(rows: list[dict]) -> dict[int, str]:
             text = item.get("text")
             if isinstance(n, bool) or not isinstance(n, int):
                 continue
-            if not isinstance(text, str):
+            if not isinstance(text, str) or not text.strip():
                 continue
             out[n] = text
     return out

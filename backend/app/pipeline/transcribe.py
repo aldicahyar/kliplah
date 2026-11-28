@@ -29,6 +29,20 @@ def transcribe(wav: Path, duration: float, out_dir: Path, transcriber: Transcrib
 
     ck = out_dir / "checkpoints"
     ck.mkdir(parents=True, exist_ok=True)
+    lang_path = ck / f"transcribe_{model_name}_lang.json"
+    resumed_lang: str | None = language or getattr(transcriber, "language", None)
+    if resumed_lang is None:
+        lang_raw = read_json(lang_path)
+        if isinstance(lang_raw, dict):
+            cached_lang = lang_raw.get("language")
+            if isinstance(cached_lang, str) and cached_lang.strip():
+                resumed_lang = cached_lang
+                if hasattr(transcriber, "language"):
+                    try:
+                        transcriber.language = resumed_lang
+                    except AttributeError:
+                        pass
+
     words: list[Word] = []
     for idx, (a, b) in enumerate(chunk_bounds(duration)):
         path = ck / f"transcribe_{model_name}_{idx}.json"
@@ -36,12 +50,22 @@ def transcribe(wav: Path, duration: float, out_dir: Path, transcriber: Transcrib
         if part is None:
             part = [w.model_dump() for w in transcriber.transcribe_chunk(wav, a, b)]
             atomic_write_json(path, part)
+            detected = getattr(transcriber, "language", None)
+            if language is None and detected and resumed_lang is None:
+                resumed_lang = detected
+                atomic_write_json(lang_path, {"language": detected})
         words.extend(Word.model_validate(w) for w in part)
         if on_progress:
             on_progress(round(b / duration, 4))
 
     words = apply_corrections(words, corrections)
-    used_lang = getattr(transcriber, "language", None) or language or "id"
+    used_lang = (
+        getattr(transcriber, "language", None)
+        or resumed_lang
+        or language
+        or getattr(transcriber, "target_language", None)
+        or "id"
+    )
     t = Transcript(language=used_lang, duration=duration, words=words, sentences=split_sentences(words))
     atomic_write_json(final, t.model_dump())
     return t

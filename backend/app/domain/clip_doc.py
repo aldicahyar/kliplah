@@ -116,8 +116,8 @@ def _m1_line(line: SubtitleLineV2, uppercase: bool, language_mode: str) -> Subti
         shown = up(line.text)
         orig = None
 
-    # Highlight-word mode relies on exact per-word timing, so approx or non-target modes fall back to whole-line.
-    has_approx = any(w.approx for w in line.words)
+    # Highlight-word mode relies on exact per-word timing, so approx, translated, or non-target modes fall back to whole-line.
+    has_approx = line.source == "translated" or any(w.approx for w in line.words)
     words = (
         []
         if (has_approx or language_mode != "target")

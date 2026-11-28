@@ -135,3 +135,26 @@ def test_clip_subtitle_lines_splits_single_sentence_across_lines():
     assert joined_original == "one two three four five six"
     assert all(line["text_original"] for line in lines)
 
+
+def test_clip_subtitle_lines_rounds_line_bounds_against_float_overshoot():
+    # 0.1 + 0.2 == 0.30000000000000004 in IEEE-754 float; unrounded bounds steal/drop a midpoint at 0.3
+    assert 0.1 + 0.2 > 0.3
+    words = [
+        Word(w="zero", start=0.15, end=0.25),   # midpoint 0.2
+        Word(w="first", start=0.25, end=0.35),  # midpoint 0.3
+        Word(w="second", start=0.4, end=0.6),   # midpoint 0.5
+    ]
+    t = Transcript(
+        language="en",
+        duration=1.0,
+        words=words,
+        sentences=[
+            Sentence(i=0, start=0.1, end=0.3, text="zero", word_range=(0, 1)),
+            Sentence(i=1, start=0.3, end=0.9, text="first second", word_range=(1, 3)),
+        ],
+    )
+    tr = Translation(language="id", source_language="en", lines={"0": "nol.", "1": "satu dua"})
+
+    lines = clip_subtitle_lines(t, tr, 0.1, 1.0, max_words=4)
+    assert [line["text_original"] for line in lines] == ["zero", "first second"]
+

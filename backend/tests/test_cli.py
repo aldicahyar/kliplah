@@ -670,3 +670,22 @@ def test_cli_export_and_import_translation(env, tmp_path, capsys):
     [clip] = _clips(settings, project.id)
     assert all(line["source"] == "translated" for line in clip.subtitles)
     assert any("terjemahan kalimat 0" in line["text"] for line in clip.subtitles)
+
+
+def test_import_non_utf8_reply_file_returns_invalid_import(env, tmp_path, capsys):
+    settings, _ = env
+    assert cli.main(["export-transcript", URL, "--source-language", "en"]) == 0
+    [project] = _projects(settings)
+    capsys.readouterr()
+
+    utf16_reply = tmp_path / "utf16_reply.json"
+    utf16_reply.write_bytes(b"\xff\xfe" + '{"clips": []}'.encode("utf-16-le"))
+    assert cli.main(["import-moments", project.id, str(utf16_reply)]) == 2
+    out_moments = capsys.readouterr().out
+    assert "[INVALID_IMPORT]" in out_moments and "UTF-8" in out_moments
+
+    bad_utf8_reply = tmp_path / "bad_utf8.json"
+    bad_utf8_reply.write_bytes(b"\xff\xfe{\"lines\": []}")
+    assert cli.main(["import-translation", project.id, str(bad_utf8_reply)]) == 2
+    out_tr = capsys.readouterr().out
+    assert "[INVALID_IMPORT]" in out_tr and "UTF-8" in out_tr

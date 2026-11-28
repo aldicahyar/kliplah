@@ -140,3 +140,21 @@ def test_bilingual_ass_sanitizes_both_lines():
         payload = subs[0].split(",", 9)[9]
         assert payload == r"{\fs75}asli tag /N /awal satu{\r}\Nteks /b1 /N /akhir baris"
         assert "{\\b1}" not in payload and "{tag}" not in payload
+
+
+@pytest.mark.parametrize("blank_orig", ["{}", "{   }", "   ", "{\n}"])
+def test_bilingual_ass_falls_back_to_single_line_when_sanitized_original_blank(blank_orig):
+    presets = load_presets()
+    words = [Word(w="halo", start=0.0, end=0.5), Word(w="dunia", start=0.5, end=1.0)]
+    line = SubtitleLine(id=1, start=0.0, end=1.0, text="halo dunia", words=words, original=blank_orig)
+
+    ass_klasik = build_ass([line], "", 3.0, "klasik", presets)
+    subs_klasik = [l for l in ass_klasik.splitlines() if l.startswith("Dialogue") and ",Sub," in l]
+    assert len(subs_klasik) == 1
+    assert subs_klasik[0].endswith(",halo dunia")
+    assert r"\N" not in subs_klasik[0] and r"\fs" not in subs_klasik[0]
+
+    ass_sorot = build_ass([line], "", 3.0, "sorot_kata", presets)
+    subs_sorot = [l for l in ass_sorot.splitlines() if l.startswith("Dialogue") and ",Sub," in l]
+    assert len(subs_sorot) == 2
+    assert all(r"\N" not in s and r"\fs" not in s for s in subs_sorot)

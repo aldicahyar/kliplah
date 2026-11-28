@@ -214,6 +214,8 @@ def _read_reply_file(path: str) -> str:
         return Path(path).read_text(encoding="utf-8")
     except OSError as e:
         raise AppError("INVALID_IMPORT", f"File balasan tidak bisa dibaca: {e}") from e
+    except UnicodeDecodeError as e:
+        raise AppError("INVALID_IMPORT", f"File balasan harus memakai encoding UTF-8: {e}") from e
 
 
 def cmd_run(args, settings: Settings) -> Path:

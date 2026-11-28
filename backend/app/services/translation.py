@@ -306,6 +306,9 @@ def refresh_clip_subtitles(
             ).all()
         )
         for clip in clips:
+            if clip.status == "rendering":
+                skipped.append(clip.id)
+                continue
             old_subs = clip.subtitles or []
             if any(isinstance(line, dict) and line.get("edited") for line in old_subs):
                 skipped.append(clip.id)

@@ -78,6 +78,73 @@ def test_later_ranges_reuse_detected_language(engine, settings):
     assert merged.language == "en"
 
 
+def test_ranged_project_keeps_detecting_when_earlier_range_had_no_lock(engine, settings):
+    pid, jid = _setup(engine, moment_source="claude_manual", ranges=[[1800, 1830], [3600, 3640]],
+                      whisper_model="small", source_language=None, target_language="id")
+    rec = RangeRecorder(settings, engine, (pid, jid))
+    seen: list[tuple[str, str | None, str]] = []
+
+    def fake_transcribe(wav, duration, tdir, model, corrections, on_progress=None,
+                        language=None, target_language="id"):
+        seen.append((wav.name, language, target_language))
+        ck = tdir / "checkpoints"
+        ck.mkdir(parents=True, exist_ok=True)
+        (ck / f"transcribe_{model}_0.json").write_text("[]", encoding="utf-8")
+        if wav.name == "audio_r0.wav":
+            # Range 0 had < 10 words: no lang checkpoint, falls back to target_language "id"
+            words = [Word(w="uh", start=0.5, end=0.8)]
+            t = Transcript(language=language or target_language, duration=duration, words=words, sentences=[])
+        else:
+            # Range 1 has enough speech and locks detection to "en"
+            (ck / f"transcribe_{model}_lang.json").write_text('{"language": "en"}', encoding="utf-8")
+            words = [Word(w=f"word{i}", start=round(0.5 + i * 0.2, 3), end=round(0.65 + i * 0.2, 3))
+                     for i in range(12)]
+            t = Transcript(language=language or "en", duration=duration, words=words, sentences=[])
+        (tdir / "transcript.json").write_text(t.model_dump_json(), encoding="utf-8")
+        return t
+
+    deps = rec.deps()
+    deps.transcribe = fake_transcribe
+    assert run_process_job(engine, jid, deps) == "paused"
+
+    assert seen == [("audio_r0.wav", None, "id"), ("audio_r1.wav", None, "id")]
+    p, _ = _rows(engine, pid, jid)
+    assert p.source_language == "en"
+    d = settings.data_dir / "projects" / pid
+    meta = VideoMeta.model_validate_json((d / "meta.json").read_text(encoding="utf-8"))
+    assert meta.source_language == "en"
+    merged = Transcript.model_validate_json((d / "transcripts" / "small" / "transcript.json").read_text(encoding="utf-8"))
+    assert merged.language == "en"
+
+
+def test_ranged_project_all_short_ranges_syncs_fallback_language(engine, settings):
+    pid, jid = _setup(engine, moment_source="claude_manual", ranges=[[1800, 1830], [3600, 3640]],
+                      whisper_model="small", source_language=None, target_language="en")
+    rec = RangeRecorder(settings, engine, (pid, jid))
+
+    def fake_transcribe(wav, duration, tdir, model, corrections, on_progress=None,
+                        language=None, target_language="id"):
+        ck = tdir / "checkpoints"
+        ck.mkdir(parents=True, exist_ok=True)
+        (ck / f"transcribe_{model}_0.json").write_text("[]", encoding="utf-8")
+        words = [Word(w="uh", start=0.5, end=0.8)]
+        t = Transcript(language=language or target_language, duration=duration, words=words, sentences=[])
+        (tdir / "transcript.json").write_text(t.model_dump_json(), encoding="utf-8")
+        return t
+
+    deps = rec.deps()
+    deps.transcribe = fake_transcribe
+    assert run_process_job(engine, jid, deps) == "paused"
+
+    p, _ = _rows(engine, pid, jid)
+    assert p.source_language == "en"
+    d = settings.data_dir / "projects" / pid
+    meta = VideoMeta.model_validate_json((d / "meta.json").read_text(encoding="utf-8"))
+    assert meta.source_language == "en"
+    merged = Transcript.model_validate_json((d / "transcripts" / "small" / "transcript.json").read_text(encoding="utf-8"))
+    assert merged.language == "en"
+
+
 def test_explicit_source_language_is_passed_through(engine, settings):
     pid, jid = _setup(engine, moment_source="claude_manual", source_language="ko", target_language="id")
     rec = Recorder(settings)

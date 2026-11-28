@@ -71,6 +71,12 @@ def _safe(name: str) -> str:
     return name.replace(":", "-").replace("/", "-")
 
 
+def _detection_locked(out_dir: Path, model: str) -> bool:
+    """Return True if a range locked auto-detection (or was produced by a mock without checkpoints/)."""
+    ck = out_dir / "checkpoints"
+    return (not ck.is_dir()) or (ck / f"transcribe_{model}_lang.json").exists()
+
+
 def transcript_dir(settings: Settings, project: Project) -> Path:
     """`projects/<id>/transcripts/<source>/`: transcript and analysis checkpoints for the project's source."""
     src = project.transcript_source
@@ -380,12 +386,13 @@ class _Run:
                     queue.set_progress(self.session, self.job_id, "transcribe", round((base + p * length) / total, 4))
 
                 part = self._call_transcribe(self.wav(rf), length, out_dir, model, corrections, progress, lang)
-                if lang is None and part.language:
+                if lang is None and part.language and _detection_locked(out_dir, model):
                     lang = part.language
                 parts.append((rf, part.words))
                 done += length
             self._transcript = merge_range_transcripts(
                 parts, PAUSE_SPLIT_SEC, lang or self.project.target_language or "id", self.meta.duration)
+            lang = self._transcript.language
             atomic_write_json(self.tdir / "transcript.json", self._transcript.model_dump())
         if self.project.source_language is None and lang:
             self.save_project(source_language=lang)

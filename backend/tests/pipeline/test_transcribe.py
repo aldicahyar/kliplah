@@ -89,6 +89,87 @@ def test_transcribe_defaults_language_to_id_when_none(tmp_path):
     assert t.language == "id"
 
 
+def test_transcribe_persists_detected_language_across_checkpoint_resume(tmp_path):
+    class PartialDetectingTranscriber:
+        def __init__(self, target_language="id"):
+            self.language: str | None = None
+            self.target_language = target_language
+            self.calls: list[tuple[float, str | None]] = []
+
+        def transcribe_chunk(self, wav, start, end):
+            self.calls.append((start, self.language))
+            if start == 0:
+                self.language = "ko"
+                return [Word(w=f"w{i}", start=start + i, end=start + i + 0.5) for i in range(12)]
+            raise RuntimeError("simulated crash on chunk 1")
+
+    f1 = PartialDetectingTranscriber()
+    try:
+        transcribe(Path("a.wav"), 1200, tmp_path, f1, "small", [])
+    except RuntimeError:
+        pass
+    assert (tmp_path / "checkpoints" / "transcribe_small_0.json").exists()
+    assert not (tmp_path / "transcript.json").exists()
+
+    class ResumedShortTranscriber:
+        def __init__(self, target_language="id"):
+            self.language: str | None = None
+            self.target_language = target_language
+            self.calls: list[tuple[float, str | None]] = []
+
+        def transcribe_chunk(self, wav, start, end):
+            # Chunk 1 has < 10 words so it cannot detect on its own; it must inherit "ko" before running.
+            self.calls.append((start, self.language))
+            return [Word(w="akhir.", start=start + 1.0, end=start + 1.5)]
+
+    f2 = ResumedShortTranscriber()
+    t = transcribe(Path("a.wav"), 1200, tmp_path, f2, "small", [], language=None)
+    assert f2.calls == [(600.0, "ko")]
+    assert f2.language == "ko"
+    assert t.language == "ko"
+
+    # Also verify resuming when every chunk is already cached before transcript.json exists
+    (tmp_path / "transcript.json").unlink()
+    f3 = ResumedShortTranscriber()
+    t3 = transcribe(Path("a.wav"), 1200, tmp_path, f3, "small", [], language=None)
+    assert f3.calls == []
+    assert t3.language == "ko"
+
+
+def test_transcribe_falls_back_to_transcriber_target_language_when_undetected(tmp_path):
+    class UndetectingTranscriber(FakeTranscriber):
+        def __init__(self, target_language="en"):
+            super().__init__()
+            self.language: str | None = None
+            self.target_language = target_language
+
+    t = transcribe(Path("a.wav"), 600, tmp_path, UndetectingTranscriber("en"), "small", [], language=None)
+    assert t.language == "en"
+    assert not (tmp_path / "checkpoints" / "transcribe_small_lang.json").exists()
+
+
+def test_transcribe_resume_ignores_readonly_language_on_slotted_fake(tmp_path):
+    (tmp_path / "checkpoints").mkdir(parents=True)
+    (tmp_path / "checkpoints" / "transcribe_small_lang.json").write_text('{"language": "ko"}', encoding="utf-8")
+
+    class SlottedReadOnlyTranscriber:
+        __slots__ = ("calls",)
+
+        @property
+        def language(self):
+            return None
+
+        def __init__(self):
+            self.calls = []
+
+        def transcribe_chunk(self, wav, start, end):
+            self.calls.append(start)
+            return [Word(w="halo.", start=start + 1, end=start + 1.5)]
+
+    t = transcribe(Path("a.wav"), 600, tmp_path, SlottedReadOnlyTranscriber(), "small", [], language=None)
+    assert t.language == "ko"
+
+
 def _rf(index, start, end):
     return RangeFile(index, start, end, f"source_r{index}.mp4")
 
