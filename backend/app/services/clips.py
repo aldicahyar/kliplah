@@ -18,14 +18,16 @@ from app.core.fs import project_dir, read_json
 from app.core.models import PlatformCaption, Transcript, VideoMeta
 from app.db.engine import session_scope
 from app.db.tables import Clip, Job, Project, utcnow
-from app.domain.clip_doc import Overlay, SubtitleLineV2, subtitles_from_m1
+from app.domain.clip_doc import Overlay, SubtitleLineV2
 from app.domain.layouts import LayoutSegment, normalize_layout_segments
 from app.domain.ranges import RangeFile, SourceMap
 from app.domain.style import effective_style, style_diff
 from app.domain.timeline import Piece, output_duration, output_to_source, remap_output_items
-from app.pipeline.subtitles import group_lines
+from app.domain.translation import Translation, load_translation
+from app.pipeline.subtitle_lines import clip_subtitle_lines
 from app.services._common import domain_errors, err, fetch
 from app.services.styles import clip_base_style
+from app.services.translation import needs_translation
 from app.worker import queue
 from app.worker.process import transcript_dir
 
@@ -34,6 +36,7 @@ RERENDER_FIELDS = ("pieces", "layout_segments", "style_override", "overlays", "s
 PLATFORMS = ("tiktok", "reels", "shorts")
 APPROVABLE = ("proposed", "rendered", "render_failed", "approved")
 RENDERABLE = ("approved", "rendered", "render_failed")
+_SUBTITLE_SOURCES = ("whisper", "youtube_manual", "youtube_auto")
 _EPS = 0.0005
 
 
@@ -55,26 +58,54 @@ def get_clip(engine: Engine, clip_id: str) -> Clip:
 
 # ---------- transcript-based subtitles ----------
 
-def _transcript_loader(session: Session, settings: Settings) -> Callable[[str], Transcript | None]:
-    cache: dict[str, Transcript | None] = {}
+def _subtitle_source(project: Project) -> str:
+    """Resolve `SubtitleLineV2.source` from `project.transcript_source`, falling back to `whisper`."""
+    return project.transcript_source if project.transcript_source in _SUBTITLE_SOURCES else "whisper"
 
-    def load(project_id: str) -> Transcript | None:
+
+def _transcript_loader(
+    session: Session, settings: Settings
+) -> Callable[[str], tuple[Transcript, Translation | None, str] | None]:
+    cache: dict[str, tuple[Transcript, Translation | None, str] | None] = {}
+
+    def load(project_id: str) -> tuple[Transcript, Translation | None, str] | None:
         if project_id not in cache:
             project = session.get(Project, project_id)
-            raw = None if project is None else read_json(transcript_dir(settings, project) / "transcript.json")
-            cache[project_id] = None if raw is None else Transcript.model_validate(raw)
+            if project is None:
+                cache[project_id] = None
+            else:
+                tdir = transcript_dir(settings, project)
+                raw = read_json(tdir / "transcript.json")
+                if raw is None:
+                    cache[project_id] = None
+                else:
+                    t = Transcript.model_validate(raw)
+                    tr = (
+                        load_translation(tdir, project.target_language, t.language)
+                        if needs_translation(t.language, project.target_language)
+                        else None
+                    )
+                    cache[project_id] = (t, tr, _subtitle_source(project))
         return cache[project_id]
 
     return load
 
 
-def _piece_lines(t: Transcript, piece: Piece, offset: float, max_words: int) -> list[dict]:
+def _piece_lines(
+    t: Transcript,
+    piece: Piece,
+    offset: float,
+    max_words: int,
+    *,
+    tr: Translation | None = None,
+    source: str = "whisper",
+) -> list[dict]:
     """Subtitle lines of one piece from the transcript, shifted to the piece's output offset."""
-    lines = subtitles_from_m1(group_lines(t.words, piece.start, piece.end, max_words=max_words))
+    lines = clip_subtitle_lines(t, tr, piece.start, piece.end, max_words=max_words, source=source)
     for line in lines:
         for item in (line, *line["words"]):
-            item["start"] = round(item["start"] + offset, 3)
-            item["end"] = round(item["end"] + offset, 3)
+            item["start"] = round(item["start"] + offset, 3) + 0.0
+            item["end"] = round(item["end"] + offset, 3) + 0.0
     return lines
 
 
@@ -82,16 +113,23 @@ def _overlaps(a: dict, b: dict) -> bool:
     return a["start"] < b["end"] - _EPS and a["end"] > b["start"] + _EPS
 
 
-def _fill_subtitles(existing: list[dict], pieces: list[Piece], load: Callable[[str], Transcript | None],
-                    max_words: int) -> list[dict]:
+def _fill_subtitles(
+    existing: list[dict],
+    pieces: list[Piece],
+    load: Callable[[str], tuple[Transcript, Translation | None, str] | None],
+    max_words: int,
+) -> list[dict]:
     """Add transcript lines that overlap no existing line; renumber ids 0..n-1 in time order."""
     out = list(existing)
     offset = 0.0
     for piece in pieces:
-        t = load(piece.project_id)
-        if t is not None:
-            out += [line for line in _piece_lines(t, piece, offset, max_words)
-                    if not any(_overlaps(line, old) for old in existing)]
+        loaded = load(piece.project_id)
+        if loaded is not None:
+            t, tr, source = loaded
+            out += [
+                line for line in _piece_lines(t, piece, offset, max_words, tr=tr, source=source)
+                if not any(_overlaps(line, old) for old in existing)
+            ]
         offset += piece.end - piece.start
     return _renumber(out)
 
@@ -352,17 +390,17 @@ def create_manual(engine: Engine, project_id: str, start: float, end: float, *,
         if project.duration_sec and piece.end > project.duration_sec + _EPS:
             raise err("VALIDATION", "Akhir klip melewati durasi video.")
         _check_piece_in_ranges(project, piece.start, piece.end, settings)
-        t = _transcript_loader(s, settings)(project_id)
-        if t is None:
+        loaded = _transcript_loader(s, settings)(project_id)
+        if loaded is None:
             raise err("INVALID_STATE", "Transkrip tidak ditemukan; proses ulang project ini.")
+        t, tr, source = loaded
         with domain_errors("style"):
             max_words = effective_style(project.style, {})["subtitle"]["words_per_line"]
         ranks = s.exec(select(Clip.rank).where(Clip.project_id == project_id)).all()
         clip = Clip(project_id=project_id, kind="single", origin="manual", rank=max(ranks, default=0) + 1,
                     score=0, llm_score=None, pieces=[piece.model_dump()], layout_segments=_layout_for([], [piece]),
                     hook_text="", hook_options=[],
-                    subtitles=_renumber(subtitles_from_m1(group_lines(t.words, piece.start, piece.end,
-                                                                       max_words=max_words))),
+                    subtitles=_renumber(_piece_lines(t, piece, 0.0, max_words, tr=tr, source=source)),
                     captions={k: {"title": "", "caption": "", "hashtags": []} for k in PLATFORMS},
                     status="proposed")
         s.add(clip)

@@ -3,6 +3,7 @@
 Edge snapping, reframing and subtitle grouping are lifted from the M1 CLI (`finish_clips`).
 `pieces` are on the source timeline; `layout_segments` and `subtitles` on the clip's output timeline.
 """
+import inspect
 import logging
 import shutil
 import subprocess
@@ -17,24 +18,28 @@ from sqlmodel import Session, select
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.core.fs import project_dir, read_json
-from app.core.models import ReframeSegment, Transcript, VideoMeta
+from app.core.models import ReframeSegment, Sentence, Transcript, VideoMeta
 from app.db.tables import Clip, Project
-from app.domain.clip_doc import subtitles_from_m1
 from app.domain.layouts import from_reframe_segments, normalize_layout_segments
 from app.domain.profiles import profile_for
-from app.domain.ranges import SourceMap
+from app.domain.ranges import RangeFile, SourceMap
 from app.domain.style import effective_style
 from app.domain.timeline import Piece
+from app.domain.translation import Translation, load_translation, merge_lines, missing_sentences, save_translation
 from app.pipeline.reframe import reframe_clip
 from app.pipeline.snap import neighbor_bounds, snap_edges
-from app.pipeline.subtitles import group_lines
-from app.worker.process import Pick, transcript_dir
+from app.pipeline.subtitle_lines import clip_subtitle_lines
+from app.pipeline.subtitles import EPS
+from app.providers.llm import LLMUnavailable
+from app.services.translation import needs_translation
+from app.worker.process import Pick, default_translate, transcript_dir
 
 log = logging.getLogger(__name__)
 
 SNAP_SLACK = 3.0  # edge refinement may stretch a clip slightly past max_sec (same as M1)
 THUMB_WIDTH = 360
 PROXY_HEIGHT = 480
+_SUBTITLE_SOURCES = ("whisper", "youtube_manual", "youtube_auto")
 
 
 def make_thumbnail(src: Path, t: float, out: Path) -> None:
@@ -65,6 +70,10 @@ class PrepareDeps:
     reframe: Callable[[Path, float, float], tuple[list[ReframeSegment], str]] | None = None
     thumbnail: Callable[[Path, float, Path], None] | None = None
     proxy: Callable[[Path, Path], None] | None = None
+    translate: Callable[
+        [list[Sentence], str, str, Path, Settings, Callable[[float], None] | None],
+        tuple[dict[int, str], list[int]],
+    ] | None = None
 
 
 def _load(d: Path, tdir: Path) -> tuple[VideoMeta, Transcript, list[tuple[float, float]]]:
@@ -74,6 +83,82 @@ def _load(d: Path, tdir: Path) -> tuple[VideoMeta, Transcript, list[tuple[float,
     if meta is None or transcript is None or silences is None:
         raise AppError("INVALID_STATE", "Data video, transkrip, atau jeda tidak ditemukan; proses ulang project ini.")
     return VideoMeta.model_validate(meta), Transcript.model_validate(transcript), [tuple(s) for s in silences]
+
+
+def _subtitle_source(project_source: str, meta_source: str | None) -> str:
+    """Resolve `SubtitleLineV2.source` from project/meta transcript_source, falling back to `whisper`."""
+    if project_source in _SUBTITLE_SOURCES:
+        return project_source
+    if meta_source in _SUBTITLE_SOURCES:
+        return meta_source
+    return "whisper"
+
+
+def _overlapping_sentence_indices(sentences: list[Sentence], spans: list[tuple[float, float]]) -> set[int]:
+    """Return indices of sentences overlapping any snapped clip span `[s, e]`."""
+    return {
+        sent.i
+        for sent in sentences
+        if any(sent.end > s + EPS and sent.start < e - EPS for s, e in spans)
+    }
+
+
+def _call_translate(
+    translate_fn: Callable[..., tuple[dict[int, str], list[int]]],
+    sentences: list[Sentence],
+    source: str,
+    target: str,
+    checkpoint_dir: Path,
+    settings: Settings,
+) -> tuple[dict[int, str], list[int]]:
+    """Invoke `translate_fn`, supplying `None` for `on_progress` only when the 6th arg is required."""
+    params = inspect.signature(translate_fn).parameters
+    positional = [
+        p for p in params.values()
+        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if len(positional) >= 6 and positional[5].default is inspect.Parameter.empty:
+        return translate_fn(sentences, source, target, checkpoint_dir, settings, None)
+    return translate_fn(sentences, source, target, checkpoint_dir, settings)
+
+
+def _ensure_clip_translations(
+    t: Transcript,
+    tdir: Path,
+    project_id: str,
+    target_language: str,
+    spans: list[tuple[float, float]],
+    deps: PrepareDeps,
+) -> Translation | None:
+    """Translate missing sentences overlapping `spans` and persist them; fall back gracefully on failure."""
+    if not needs_translation(t.language, target_language):
+        return None
+    tr = load_translation(tdir, target_language, t.language)
+    needed = _overlapping_sentence_indices(t.sentences, spans)
+    missing = missing_sentences(t, tr, indices=needed)
+    if not missing:
+        return tr
+    translate_fn = default_translate if deps.translate is None else deps.translate
+    try:
+        translated, failed = _call_translate(
+            translate_fn, missing, t.language, target_language, tdir / "checkpoints", deps.settings
+        )
+    except LLMUnavailable as e:
+        log.warning(
+            "Ollama tidak tersedia saat menerjemahkan subtitle klip untuk project %s (%s); teks asli dipakai.",
+            project_id,
+            e,
+        )
+        return tr
+    if merge_lines(tr, translated, valid={s.i for s in missing}) > 0:
+        save_translation(tdir, tr)
+    if failed:
+        log.warning(
+            "%d kalimat gagal diterjemahkan untuk project %s; teks asli dipertahankan.",
+            len(failed),
+            project_id,
+        )
+    return tr
 
 
 def build_clips_from_picks(engine: Engine, project_id: str, picks: list[Pick], deps: PrepareDeps) -> list[str]:
@@ -87,17 +172,19 @@ def build_clips_from_picks(engine: Engine, project_id: str, picks: list[Pick], d
         if project is None:
             raise AppError("NOT_FOUND", f"Project {project_id} tidak ditemukan", status=404)
         tdir = transcript_dir(deps.settings, project)
+        target_language = project.target_language
+        project_source = project.transcript_source
         max_sec = project.max_clip_sec or profile_for(project.content_type).max_sec
         words_per_line = effective_style(project.style or {}, {})["subtitle"]["words_per_line"]
 
     d = project_dir(deps.settings, project_id)
     meta, t, silences = _load(d, tdir)
     smap = SourceMap.from_meta(meta, d, t)
+    sub_source = _subtitle_source(project_source, meta.transcript_source)
 
     by_time = sorted(picks, key=lambda p: p[0].start)
     spans = [(c.start, c.end) for c, _ in by_time]
-    clips: list[Clip] = []
-    thumb_loc: dict[str, tuple[Path, float]] = {}
+    prepared: list[tuple[Pick, RangeFile, float, float]] = []
     for i, (cand, mats) in enumerate(by_time):
         rf = smap.locate_span(cand.start, cand.end)
         if rf is None:
@@ -107,6 +194,13 @@ def build_clips_from_picks(engine: Engine, project_id: str, picks: list[Pick], d
         lower, upper = max(lower, rf.start), min(upper, rf.end)
         s, e = snap_edges(cand.start, cand.end, t.words, t.sentences, silences, lower=lower, upper=upper,
                           max_len=max_sec + SNAP_SLACK)
+        prepared.append(((cand, mats), rf, s, e))
+
+    tr = _ensure_clip_translations(t, tdir, project_id, target_language, [(s, e) for _, _, s, e in prepared], deps)
+
+    clips: list[Clip] = []
+    thumb_loc: dict[str, tuple[Path, float]] = {}
+    for (cand, mats), rf, s, e in prepared:
         src = smap.path(rf)
         ls = max(0.0, smap.to_local(rf, s))
         le = max(ls, smap.to_local(rf, e))
@@ -125,7 +219,7 @@ def build_clips_from_picks(engine: Engine, project_id: str, picks: list[Pick], d
             layout_segments=normalize_layout_segments(
                 [seg.model_dump() for seg in from_reframe_segments(segs)], round(e - s, 3)),
             hook_text=mats.hook, hook_options=[mats.hook],
-            subtitles=subtitles_from_m1(group_lines(t.words, s, e, max_words=words_per_line)),
+            subtitles=clip_subtitle_lines(t, tr, s, e, max_words=words_per_line, source=sub_source),
             captions={"tiktok": mats.tiktok.model_dump(), "reels": mats.reels.model_dump(),
                       "shorts": mats.shorts.model_dump()},
             status="proposed"))

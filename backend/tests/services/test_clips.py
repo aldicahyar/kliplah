@@ -258,3 +258,114 @@ def test_patch_piece_outside_ranges_rejected(engine, settings, ready_project, ma
 
     ok = clips.create_manual(engine, project.id, 105.0, 120.0, settings=settings)
     assert ok.pieces == [{"project_id": project.id, "start": 105.0, "end": 120.0}]
+
+
+def test_clip_gap_fill_keeps_translation_and_original(engine, settings):
+    from app.core.models import Sentence, Transcript, Word
+    from app.domain.style import default_style
+    from app.domain.translation import Translation, save_translation
+    from app.pipeline.subtitle_lines import clip_subtitle_lines
+    from app.worker.process import transcript_dir
+
+    words: list[Word] = []
+    sentences: list[Sentence] = []
+    each = 6.0
+    for i in range(10):
+        toks = [f"eng{i}a", f"eng{i}b", f"eng{i}c", f"eng{i}d"]
+        a = len(words)
+        for j, tok in enumerate(toks):
+            st = round(i * each + j * 1.4, 3)
+            en = round(st + 1.3, 3)
+            words.append(Word(w=tok, start=st, end=en, prob=0.95, approx=False))
+        sentences.append(
+            Sentence(
+                i=i,
+                start=words[a].start,
+                end=words[-1].end,
+                text=" ".join(toks),
+                word_range=(a, len(words)),
+            )
+        )
+    t = Transcript(language="en", duration=60.0, words=words, sentences=sentences)
+
+    with Session(engine, expire_on_commit=False) as s:
+        p = Project(
+            status="ready",
+            whisper_model="small",
+            source_language="en",
+            target_language="id",
+            transcript_source="youtube_manual",
+            style=default_style(),
+            duration_sec=t.duration,
+            last_completed_stage="prepare",
+        )
+        s.add(p)
+        s.commit()
+        tdir = transcript_dir(settings, p)
+
+    tdir.mkdir(parents=True, exist_ok=True)
+    (tdir / "transcript.json").write_text(t.model_dump_json(), encoding="utf-8")
+    tr = Translation(
+        language="id",
+        source_language="en",
+        lines={str(i): f"indo kalimat {i}" for i in range(1, 9)},
+    )
+    save_translation(tdir, tr)
+
+    initial_subs = clip_subtitle_lines(t, tr, 12.0, 24.0, max_words=4, source="youtube_manual")
+    initial_subs[0]["text"] = "teks diedit manual"
+    initial_subs[0]["edited"] = True
+    with Session(engine, expire_on_commit=False) as s:
+        clip = Clip(
+            project_id=p.id,
+            origin="ai",
+            rank=1,
+            score=80,
+            status="proposed",
+            pieces=[{"project_id": p.id, "start": 12.0, "end": 24.0}],
+            layout_segments=[
+                {"start": 0.0, "end": 12.0, "layout": "fit_blur", "params": {}, "piece_index": 0, "user_override": False}
+            ],
+            subtitles=initial_subs,
+        )
+        s.add(clip)
+        s.commit()
+
+    out = clips.patch_clip(
+        engine,
+        clip.id,
+        {"pieces": [{"project_id": p.id, "start": 0.0, "end": 30.0}]},
+        settings=settings,
+    )
+    assert [s["id"] for s in out.subtitles] == list(range(len(out.subtitles)))
+    assert _no_overlap(out.subtitles)
+
+    sent0_line = next(s for s in out.subtitles if s["end"] <= 6.0)
+    assert sent0_line["text"] == "eng0a eng0b eng0c eng0d"
+    assert sent0_line["text_original"] is None
+    assert sent0_line["source"] == "youtube_manual"
+
+    sent1_line = next(s for s in out.subtitles if 6.0 <= s["start"] < s["end"] <= 12.0)
+    assert sent1_line["text"] == "indo kalimat 1"
+    assert sent1_line["text_original"] == "eng1a eng1b eng1c eng1d"
+    assert sent1_line["source"] == "translated"
+    assert all(w["approx"] is True for w in sent1_line["words"])
+
+    edited = [s for s in out.subtitles if s["edited"]]
+    assert len(edited) == 1
+    assert edited[0]["text"] == "teks diedit manual"
+    assert edited[0]["start"] == pytest.approx(initial_subs[0]["start"] + 12.0)
+
+    tail_line = next(s for s in out.subtitles if s["start"] >= 24.0)
+    assert tail_line["text"] == "indo kalimat 4"
+    assert tail_line["text_original"] == "eng4a eng4b eng4c eng4d"
+    assert tail_line["source"] == "translated"
+
+    manual = clips.create_manual(engine, p.id, 30.0, 42.0, settings=settings)
+    assert [s["id"] for s in manual.subtitles] == list(range(len(manual.subtitles)))
+    assert [s["text"] for s in manual.subtitles] == ["indo kalimat 5", "indo kalimat 6"]
+    assert [s["text_original"] for s in manual.subtitles] == [
+        "eng5a eng5b eng5c eng5d",
+        "eng6a eng6b eng6c eng6d",
+    ]
+    assert all(s["source"] == "translated" for s in manual.subtitles)

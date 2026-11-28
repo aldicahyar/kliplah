@@ -1,4 +1,5 @@
 import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -6,10 +7,15 @@ import pytest
 from sqlmodel import Session, select
 
 from app.core.config import Settings
-from app.core.models import Candidate, Materials, PlatformCaption, ReframeSegment, VideoMeta
+from app.core.models import Candidate, Materials, PlatformCaption, ReframeSegment, Sentence, Transcript, VideoMeta, Word
 from app.db.engine import get_engine, init_db
 from app.db.tables import Clip, Project
+from app.domain.clip_doc import SubtitleLineV2, subtitles_from_m1
+from app.domain.translation import Translation, load_translation, save_translation, translation_path
+from app.pipeline.subtitles import group_lines
+from app.providers.llm import LLMUnavailable
 from app.worker.prepare import PrepareDeps, build_clips_from_picks, make_proxy, make_thumbnail, prepare_project_clips
+from app.worker.process import transcript_dir
 from tests.helpers import make_transcript
 
 
@@ -315,3 +321,235 @@ def test_prepare_legacy_keeps_last_clip_ending_slightly_after_rounded_meta_durat
     [clip] = _clips(engine, pid)
     assert clip.pieces[0]["end"] == pytest.approx(180.8, abs=0.1)
     assert clip.pieces[0]["end"] > 180.5
+
+
+def _foreign_project(
+    engine,
+    settings,
+    *,
+    n: int = 10,
+    each: float = 6.0,
+    lang: str = "en",
+    target_language: str = "id",
+    transcript_source: str = "whisper",
+    words_per_line: int = 4,
+) -> tuple[str, Path, Transcript]:
+    words: list[Word] = []
+    sentences: list[Sentence] = []
+    for i in range(n):
+        toks = [f"sent{i}w0", f"sent{i}w1", f"sent{i}w2", f"sent{i}w3"]
+        a = len(words)
+        for j, tok in enumerate(toks):
+            st = round(i * each + j * 1.4, 3)
+            en = round(st + 1.3, 3)
+            words.append(Word(w=tok, start=st, end=en, prob=0.95, approx=False))
+        sentences.append(
+            Sentence(
+                i=i,
+                start=words[a].start,
+                end=words[-1].end,
+                text=" ".join(toks),
+                word_range=(a, len(words)),
+            )
+        )
+    t = Transcript(language=lang, duration=round(n * each, 3), words=words, sentences=sentences)
+    with Session(engine, expire_on_commit=False) as s:
+        p = Project(
+            youtube_url="https://youtu.be/dQw4w9WgXcQ",
+            source_language=lang,
+            target_language=target_language,
+            transcript_source=transcript_source,
+            style={"subtitle": {"words_per_line": words_per_line}},
+        )
+        s.add(p)
+        s.commit()
+        pid = p.id
+        tdir = transcript_dir(settings, p)
+    d = Path(settings.data_dir) / "projects" / pid
+    tdir.mkdir(parents=True, exist_ok=True)
+    (d / "source.mp4").write_bytes(b"v")
+    (tdir / "transcript.json").write_text(t.model_dump_json(), encoding="utf-8")
+    (d / "silences.json").write_text("[]", encoding="utf-8")
+    meta = VideoMeta(
+        source_type="youtube",
+        project_id=pid,
+        title="Foreign Video",
+        duration=t.duration,
+        transcript_source=transcript_source,
+        source_language=lang,
+    )
+    (d / "meta.json").write_text(meta.model_dump_json(), encoding="utf-8")
+    return pid, tdir, t
+
+
+def test_prepare_uses_existing_translation_for_clip_lines(engine, settings, monkeypatch):
+    from app.worker import prepare, process
+
+    pid, tdir, _ = _foreign_project(engine, settings, transcript_source="youtube_manual")
+    save_translation(
+        tdir,
+        Translation(
+            language="id",
+            source_language="en",
+            lines={"2": "kalimat dua indonesia", "3": "kalimat tiga indonesia"},
+        ),
+    )
+
+    def fail_translate(*args, **kwargs):
+        raise AssertionError("translate must not be called when clip lines already translated")
+
+    monkeypatch.setattr(prepare, "default_translate", fail_translate, raising=False)
+    monkeypatch.setattr(process, "default_translate", fail_translate)
+
+    media = FakeMedia()
+    deps = PrepareDeps(settings=settings, reframe=media.reframe, thumbnail=media.thumbnail)
+    ids = build_clips_from_picks(engine, pid, [_pick(12.0, 24.0, 90)], deps)
+    assert len(ids) == 1
+    [clip] = _clips(engine, pid)
+    assert [line["text"] for line in clip.subtitles] == ["kalimat dua indonesia", "kalimat tiga indonesia"]
+    assert [line["text_original"] for line in clip.subtitles] == [
+        "sent2w0 sent2w1 sent2w2 sent2w3",
+        "sent3w0 sent3w1 sent3w2 sent3w3",
+    ]
+    assert all(line["source"] == "translated" for line in clip.subtitles)
+    for line in clip.subtitles:
+        SubtitleLineV2.model_validate(line)
+
+
+def test_prepare_translates_missing_sentences_with_ollama(engine, settings):
+    pid, tdir, _ = _foreign_project(engine, settings, n=10, transcript_source="whisper")
+    save_translation(
+        tdir,
+        Translation(language="id", source_language="en", lines={"2": "kalimat dua sudah ada"}),
+    )
+
+    calls: list[tuple[list[int], str, str, Path]] = []
+
+    def fake_translate(sentences, source, target, checkpoint_dir, s, on_progress=None):
+        calls.append(([sent.i for sent in sentences], source, target, checkpoint_dir))
+        return {sent.i: f"terjemahan kalimat {sent.i}" for sent in sentences}, []
+
+    media = FakeMedia()
+    deps = PrepareDeps(
+        settings=settings,
+        reframe=media.reframe,
+        thumbnail=media.thumbnail,
+        translate=fake_translate,
+    )
+    ids = build_clips_from_picks(engine, pid, [_pick(12.0, 24.0, 90), _pick(18.0, 30.0, 80)], deps)
+    assert len(ids) == 2
+    assert calls == [([3, 4], "en", "id", tdir / "checkpoints")]
+
+    saved = load_translation(tdir, "id", "en")
+    assert saved.lines == {
+        "2": "kalimat dua sudah ada",
+        "3": "terjemahan kalimat 3",
+        "4": "terjemahan kalimat 4",
+    }
+
+    top, second = _clips(engine, pid)
+    assert [line["text"] for line in top.subtitles] == [
+        "kalimat dua sudah ada",
+        "terjemahan kalimat 3",
+    ]
+    assert [line["text_original"] for line in top.subtitles] == [
+        "sent2w0 sent2w1 sent2w2 sent2w3",
+        "sent3w0 sent3w1 sent3w2 sent3w3",
+    ]
+    assert all(line["source"] == "translated" for line in top.subtitles)
+    assert [line["text"] for line in second.subtitles] == [
+        "terjemahan kalimat 3",
+        "terjemahan kalimat 4",
+    ]
+    assert all(line["source"] == "translated" for line in second.subtitles)
+
+
+def test_prepare_missing_translation_falls_back_to_original(engine, settings, caplog):
+    pid, tdir, _ = _foreign_project(engine, settings, transcript_source="youtube_manual")
+
+    def down_translate(*args, **kwargs):
+        raise LLMUnavailable("Ollama tidak berjalan")
+
+    media = FakeMedia()
+    deps = PrepareDeps(
+        settings=settings,
+        reframe=media.reframe,
+        thumbnail=media.thumbnail,
+        translate=down_translate,
+    )
+    with caplog.at_level(logging.WARNING):
+        ids = build_clips_from_picks(engine, pid, [_pick(12.0, 24.0, 90)], deps)
+
+    assert len(ids) == 1
+    [clip] = _clips(engine, pid)
+    assert clip.status == "proposed"
+    assert [line["text"] for line in clip.subtitles] == [
+        "sent2w0 sent2w1 sent2w2 sent2w3",
+        "sent3w0 sent3w1 sent3w2 sent3w3",
+    ]
+    assert all(line["text_original"] is None for line in clip.subtitles)
+    assert all(line["source"] == "youtube_manual" for line in clip.subtitles)
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+    # Partial sentence failure keeps translated lines, falls back failed sentences, and warns
+    caplog.clear()
+    pid2, tdir2, _ = _foreign_project(engine, settings, transcript_source="youtube_auto")
+
+    def partial_translate(sentences, source, target, checkpoint_dir, s, on_progress=None):
+        return {2: "kalimat dua terjemahan"}, [3]
+
+    deps2 = PrepareDeps(
+        settings=settings,
+        reframe=media.reframe,
+        thumbnail=media.thumbnail,
+        translate=partial_translate,
+    )
+    with caplog.at_level(logging.WARNING):
+        ids2 = build_clips_from_picks(engine, pid2, [_pick(12.0, 24.0, 90)], deps2)
+
+    assert len(ids2) == 1
+    [clip2] = _clips(engine, pid2)
+    assert [line["text"] for line in clip2.subtitles] == [
+        "kalimat dua terjemahan",
+        "sent3w0 sent3w1 sent3w2 sent3w3",
+    ]
+    assert [line["source"] for line in clip2.subtitles] == ["translated", "youtube_auto"]
+    assert [line["text_original"] for line in clip2.subtitles] == [
+        "sent2w0 sent2w1 sent2w2 sent2w3",
+        None,
+    ]
+    assert load_translation(tdir2, "id", "en").lines == {"2": "kalimat dua terjemahan"}
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_prepare_indonesian_transcript_unchanged(engine, settings, monkeypatch):
+    from app.worker import prepare, process
+
+    def fail_translate(*args, **kwargs):
+        raise AssertionError("translate must not be called for target-language transcript")
+
+    monkeypatch.setattr(prepare, "default_translate", fail_translate, raising=False)
+    monkeypatch.setattr(process, "default_translate", fail_translate)
+
+    media = FakeMedia()
+    deps = PrepareDeps(settings=settings, reframe=media.reframe, thumbnail=media.thumbnail)
+
+    for src, lang, expected_source in (
+        ("whisper", "id", "whisper"),
+        ("youtube_manual", "id", "youtube_manual"),
+        ("youtube_auto", "id", "youtube_auto"),
+        ("auto", "id-ID", "whisper"),
+    ):
+        pid, tdir, t = _foreign_project(
+            engine, settings, lang=lang, target_language="id", transcript_source=src, words_per_line=2
+        )
+        ids = build_clips_from_picks(engine, pid, [_pick(12.0, 24.0, 90)], deps)
+        assert len(ids) == 1
+        assert not translation_path(tdir).exists()
+        [clip] = _clips(engine, pid)
+        piece = clip.pieces[0]
+        expected = subtitles_from_m1(group_lines(t.words, piece["start"], piece["end"], max_words=2))
+        if expected_source != "whisper":
+            for item in expected:
+                item["source"] = expected_source
+        assert clip.subtitles == expected
