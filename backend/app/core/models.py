@@ -46,6 +46,8 @@ class VideoMeta(BaseModel):
     subtitles: dict = {}  # {"manual": [lang...], "auto": [lang...]}
     has_live_chat: bool = False
     transcript_source: str | None = None  # source actually used
+    language: str | None = None  # hint from yt-dlp info["language"], normalized
+    source_language: str | None = None  # transcript language actually used
 
 
 class Window(BaseModel):

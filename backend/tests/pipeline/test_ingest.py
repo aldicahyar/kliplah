@@ -463,3 +463,17 @@ def test_range_end_adjusted_to_real_file_duration(tmp_path, range_ydl, monkeypat
     _, meta_err = ingest_youtube("https://youtu.be/dQw4w9WgXcQ", s, project_id="p-err", ranges=[[1800, 3600]])
     assert meta_err.ranges[0]["end"] == 3600.0
     assert any("ffprobe" in rec.message.lower() for rec in caplog.records)
+
+
+def test_meta_from_info_reads_language_hint(info):
+    info["language"] = "ko"
+    assert meta_from_info(info).language == "ko"
+
+    info["language"] = "pt-BR"
+    assert meta_from_info(info).language == "pt"
+
+    info.pop("language", None)
+    assert meta_from_info(info).language is None
+
+    info["language"] = "zz"
+    assert meta_from_info(info).language is None

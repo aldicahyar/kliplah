@@ -13,8 +13,10 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError, download_range_func
 
 from app.core.config import DEFAULT_RANGE_MAX_HEIGHT, Settings, default_encode_threads
+from app.core.errors import AppError
 from app.core.fs import atomic_write_json, project_dir, read_json
 from app.core.models import HeatPoint, VideoMeta
+from app.domain.languages import normalize_language
 from app.domain.ranges import RangeFile, normalize_ranges
 
 log = logging.getLogger(__name__)
@@ -58,10 +60,15 @@ def meta_from_info(info: dict) -> VideoMeta:
     orig = sorted(k.removesuffix("-orig") for k in auto_caps if k.endswith("-orig") and k != "-orig")
     subtitles = {"manual": sorted(lang for lang in subs if lang != "live_chat"),
                  "auto": orig if orig else sorted(auto_caps)}
+    raw_lang = info.get("language")
+    try:
+        lang = normalize_language(raw_lang) if isinstance(raw_lang, str) else None
+    except AppError:
+        lang = None
     return VideoMeta(source_type="youtube", project_id=info["id"], title=info.get("title") or info["id"],
                      channel=info.get("channel") or info.get("uploader"), duration=float(info.get("duration") or 0),
                      video_id=info["id"], heatmap=heat, chapters=chapters, subtitles=subtitles,
-                     has_live_chat="live_chat" in subs)
+                     has_live_chat="live_chat" in subs, language=lang)
 
 
 def ytdl_base_opts(settings: Settings, cookies_browser: str = "") -> dict:

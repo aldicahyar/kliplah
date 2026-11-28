@@ -1,0 +1,21 @@
+{
+  "id": {"name_id": "Indonesia", "name_en": "Indonesian", "whisper": true, "weak_local_translation": false},
+  "ms": {"name_id": "Melayu", "name_en": "Malay", "whisper": true, "weak_local_translation": false},
+  "en": {"name_id": "Inggris", "name_en": "English", "whisper": true, "weak_local_translation": false},
+  "ko": {"name_id": "Korea", "name_en": "Korean", "whisper": true, "weak_local_translation": true},
+  "ja": {"name_id": "Jepang", "name_en": "Japanese", "whisper": true, "weak_local_translation": true},
+  "zh": {"name_id": "Mandarin", "name_en": "Chinese", "whisper": true, "weak_local_translation": true},
+  "th": {"name_id": "Thailand", "name_en": "Thai", "whisper": true, "weak_local_translation": true},
+  "vi": {"name_id": "Vietnam", "name_en": "Vietnamese", "whisper": true, "weak_local_translation": false},
+  "tl": {"name_id": "Tagalog", "name_en": "Tagalog", "whisper": true, "weak_local_translation": false},
+  "es": {"name_id": "Spanyol", "name_en": "Spanish", "whisper": true, "weak_local_translation": false},
+  "fr": {"name_id": "Prancis", "name_en": "French", "whisper": true, "weak_local_translation": false},
+  "de": {"name_id": "Jerman", "name_en": "German", "whisper": true, "weak_local_translation": false},
+  "pt": {"name_id": "Portugis", "name_en": "Portuguese", "whisper": true, "weak_local_translation": false},
+  "ru": {"name_id": "Rusia", "name_en": "Russian", "whisper": true, "weak_local_translation": false},
+  "ar": {"name_id": "Arab", "name_en": "Arabic", "whisper": true, "weak_local_translation": false},
+  "hi": {"name_id": "Hindi", "name_en": "Hindi", "whisper": true, "weak_local_translation": false},
+  "it": {"name_id": "Italia", "name_en": "Italian", "whisper": true, "weak_local_translation": false},
+  "nl": {"name_id": "Belanda", "name_en": "Dutch", "whisper": true, "weak_local_translation": false},
+  "tr": {"name_id": "Turki", "name_en": "Turkish", "whisper": true, "weak_local_translation": false}
+}
