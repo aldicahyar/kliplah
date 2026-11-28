@@ -358,7 +358,7 @@ def test_ingest_ranges_does_not_reuse_stale_files_when_ranges_differ(tmp_path, r
 
 def test_probe_filters_auto_captions_to_orig_languages(monkeypatch, tmp_path, info):
     from app.core.errors import AppError
-    from app.pipeline.youtube_subs import resolve_transcript_source
+    from app.pipeline.youtube_subs import SubtitlePlan, resolve_subtitle_plan
 
     info["automatic_captions"] = {
         "en-orig": [{"ext": "json3"}],
@@ -369,8 +369,10 @@ def test_probe_filters_auto_captions_to_orig_languages(monkeypatch, tmp_path, in
     monkeypatch.setattr(ingest, "YoutubeDL", _DownloadingYDL)
     meta = probe_youtube("https://youtu.be/dQw4w9WgXcQ", Settings(_env_file=None, data_dir=tmp_path))
     assert meta.subtitles["auto"] == ["en"]
+    assert resolve_subtitle_plan("youtube_auto", meta, "id") == SubtitlePlan("youtube_auto", "en", True)
+    empty = meta.model_copy(update={"subtitles": {"manual": [], "auto": []}})
     with pytest.raises(AppError) as e:
-        resolve_transcript_source("youtube_auto", meta, "id")
+        resolve_subtitle_plan("youtube_auto", empty, "id")
     assert e.value.code == "VALIDATION"
 
 

@@ -1,4 +1,5 @@
 """Download, parse, and range-clip YouTube json3 subtitles."""
+from dataclasses import dataclass
 import re
 from pathlib import Path
 from typing import Literal
@@ -9,12 +10,22 @@ from yt_dlp.utils import DownloadError
 from app.core.config import Settings
 from app.core.errors import AppError
 from app.core.models import VideoMeta, Word
+from app.domain.languages import normalize_language
 from app.domain.ranges import RangeFile
 from app.pipeline.ingest import _map_download_error, _watch_url, ytdl_base_opts
 
 SUBTITLE_PAUSE_SPLIT_SEC = 1.0
 TRANSCRIPT_SOURCES = ("auto", "youtube_manual", "youtube_auto", "whisper")
 _TAG_RE = re.compile(r"<[^>]+>|\{\\[^}]*\}")
+
+
+@dataclass(frozen=True)
+class SubtitlePlan:
+    """Resolved subtitle/transcription plan before downloading or running Whisper."""
+
+    source: str
+    language: str | None
+    needs_translation: bool | None
 
 
 def _r(t: float) -> float:
@@ -25,8 +36,11 @@ def _clean_words(text: str) -> list[str]:
     return [tok for tok in _TAG_RE.sub("", text).split() if tok]
 
 
-def _distribute_words(toks: list[str], start: float, end: float, *, approx: bool) -> list[Word]:
+def distribute_words(toks: list[str], start: float, end: float, *, approx: bool) -> list[Word]:
+    """Distribute timing over ``toks`` proportional to character length."""
     total = sum(len(t) for t in toks)
+    if not toks or total <= 0:
+        return []
     dur = max(0.0, end - start)
     out: list[Word] = []
     acc = 0
@@ -38,26 +52,76 @@ def _distribute_words(toks: list[str], start: float, end: float, *, approx: bool
     return out
 
 
-def resolve_transcript_source(requested: str, meta: VideoMeta, target_language: str) -> str:
-    """Resolve `auto|youtube_manual|youtube_auto|whisper` against `meta.subtitles` for `target_language`."""
+_distribute_words = distribute_words
+
+
+def _safe_norm(code: str | None) -> str | None:
+    if code is None:
+        return None
+    try:
+        return normalize_language(code)
+    except AppError:
+        cleaned = code.strip().lower()
+        return cleaned or None
+
+
+def _match_lang(langs: list[str], raw: str | None, norm: str | None) -> str | None:
+    if raw and raw in langs:
+        return raw
+    if not norm:
+        return None
+    if norm in langs:
+        return norm
+    for code in sorted(langs):
+        if _safe_norm(code) == norm:
+            return code
+    return None
+
+
+def _pick_manual_lang(manual: list[str], target_raw: str, target_norm: str,
+                      source_raw: str | None, source_norm: str | None) -> str:
+    for raw, norm in ((target_raw, target_norm), (source_raw, source_norm), ("en", "en")):
+        hit = _match_lang(manual, raw, norm)
+        if hit is not None:
+            return hit
+    return sorted(manual)[0]
+
+
+def resolve_subtitle_plan(requested: str, meta: VideoMeta, target_language: str,
+                          source_language: str | None = None) -> SubtitlePlan:
+    """Resolve ``auto|youtube_manual|youtube_auto|whisper`` against ``meta.subtitles``."""
     if requested not in TRANSCRIPT_SOURCES:
         raise AppError("VALIDATION", f"Sumber transkrip harus salah satu dari: {', '.join(TRANSCRIPT_SOURCES)}.",
                        status=422)
     if meta.source_type == "upload":
-        return "whisper"
+        return SubtitlePlan("whisper", None, None)
+
+    norm_target = _safe_norm(target_language) or "id"
+    norm_source = _safe_norm(source_language)
+    if requested == "whisper":
+        return SubtitlePlan("whisper", norm_source, None)
+
     manual = meta.subtitles.get("manual") or []
     auto = meta.subtitles.get("auto") or []
-    if requested == "auto":
-        return "youtube_manual" if target_language in manual else "whisper"
-    if requested == "whisper":
-        return "whisper"
-    if requested == "youtube_manual":
-        if target_language not in manual:
-            raise AppError("VALIDATION", f"Subtitle resmi bahasa '{target_language}' tidak tersedia.", status=422)
-        return "youtube_manual"
-    if target_language not in auto:
-        raise AppError("VALIDATION", f"Subtitle otomatis bahasa '{target_language}' tidak tersedia.", status=422)
-    return "youtube_auto"
+
+    if requested in ("auto", "youtube_manual"):
+        if not manual:
+            if requested == "auto":
+                return SubtitlePlan("whisper", norm_source, None)
+            raise AppError("VALIDATION", "Subtitle resmi YouTube tidak tersedia untuk video ini.", status=422)
+        chosen = _pick_manual_lang(manual, target_language, norm_target, source_language, norm_source)
+        return SubtitlePlan("youtube_manual", chosen, (_safe_norm(chosen) or chosen) != norm_target)
+
+    if not auto:
+        raise AppError("VALIDATION", "Subtitle otomatis YouTube tidak tersedia untuk video ini.", status=422)
+    chosen = _match_lang(auto, target_language, norm_target) or sorted(auto)[0]
+    return SubtitlePlan("youtube_auto", chosen, (_safe_norm(chosen) or chosen) != norm_target)
+
+
+def resolve_transcript_source(requested: str, meta: VideoMeta, target_language: str,
+                              source_language: str | None = None) -> str:
+    """Resolve ``auto|youtube_manual|youtube_auto|whisper`` against ``meta.subtitles``."""
+    return resolve_subtitle_plan(requested, meta, target_language, source_language).source
 
 
 def _auto_sub_lang(video_id: str, lang: str, settings: Settings, cookies_browser: str) -> str:
@@ -135,12 +199,12 @@ def parse_json3(data: dict) -> list[Word]:
                 if len(toks) == 1:
                     words.append(Word(w=toks[0], start=w_start, end=w_end, approx=False))
                 else:
-                    words.extend(_distribute_words(toks, w_start, w_end, approx=False))
+                    words.extend(distribute_words(toks, w_start, w_end, approx=False))
         else:
             raw_text = "".join(s.get("utf8") or "" for s in segs if isinstance(s, dict))
             toks = _clean_words(raw_text)
             if toks:
-                words.extend(_distribute_words(toks, _r(start_ms / 1000.0), _r(end_ms / 1000.0), approx=True))
+                words.extend(distribute_words(toks, _r(start_ms / 1000.0), _r(end_ms / 1000.0), approx=True))
     return words
 
 

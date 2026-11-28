@@ -39,7 +39,7 @@ from app.pipeline.youtube_subs import (
     clip_words_to_ranges,
     download_subs,
     parse_json3,
-    resolve_transcript_source,
+    resolve_subtitle_plan,
 )
 from app.providers.llm import OllamaClient
 from app.providers.transcriber import FasterWhisperTranscriber
@@ -243,14 +243,27 @@ class _Run:
             if probe_fn is not None:
                 probed = probe_fn(self.project, self.settings)
                 if probed is not None:
-                    resolve_transcript_source(self.project.transcript_source, probed, self.project.target_language)
+                    resolve_subtitle_plan(
+                        self.project.transcript_source, probed,
+                        self.project.target_language, self.project.source_language,
+                    )
         _, meta = self.deps.ingest(self.project, self.settings)
-        source = resolve_transcript_source(self.project.transcript_source, meta, self.project.target_language)
-        meta = meta.model_copy(update={"transcript_source": source})
+        plan = resolve_subtitle_plan(
+            self.project.transcript_source, meta,
+            self.project.target_language, self.project.source_language,
+        )
+        is_yt_sub = plan.source in ("youtube_manual", "youtube_auto")
+        meta = meta.model_copy(update={
+            "transcript_source": plan.source,
+            "source_language": plan.language if is_yt_sub else meta.source_language,
+        })
         atomic_write_json(self.dir / "meta.json", meta.model_dump())
         self._meta = meta
+        updates: dict = {"transcript_source": plan.source}
+        if is_yt_sub:
+            updates["source_language"] = plan.language
         self.save_project(title=meta.title, channel=meta.channel, duration_sec=meta.duration,
-                          video_id=meta.video_id, has_heatmap=bool(meta.heatmap), transcript_source=source)
+                          video_id=meta.video_id, has_heatmap=bool(meta.heatmap), **updates)
 
     @property
     def ranged(self) -> bool:
@@ -278,7 +291,7 @@ class _Run:
         cached = read_json(self.tdir / "transcript.json")
         if cached is not None:
             return Transcript.model_validate(cached)
-        lang = self.project.target_language
+        lang = self.project.source_language or self.project.target_language
         kind: Literal["manual", "auto"] = "manual" if self.project.transcript_source == "youtube_manual" else "auto"
         vid = self.meta.video_id or self.project.video_id
         if not vid:

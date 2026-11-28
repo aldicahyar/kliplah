@@ -193,7 +193,7 @@ def test_probe_estimates_and_warns_for_long_video(engine, settings, monkeypatch)
     meta = VideoMeta(
         source_type="youtube", project_id="vid1", title="Stream 8 Jam", channel="Tara",
         duration=31380.0, video_id="vid1", heatmap=[], chapters=[{"start": 0.0, "end": 600.0, "title": "Intro"}],
-        subtitles={"manual": ["en"], "auto": ["id"]}, has_live_chat=True,
+        subtitles={"manual": [], "auto": ["id"]}, has_live_chat=True,
     )
     monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta)
 

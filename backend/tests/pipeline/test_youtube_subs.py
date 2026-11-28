@@ -13,9 +13,12 @@ from app.db.tables import Project
 from app.domain.ranges import RangeFile
 from app.pipeline import youtube_subs
 from app.pipeline.youtube_subs import (
+    SubtitlePlan,
     clip_words_to_ranges,
+    distribute_words,
     download_subs,
     parse_json3,
+    resolve_subtitle_plan,
     resolve_transcript_source,
 )
 from app.services.settings_store import put_app_settings
@@ -113,7 +116,7 @@ def test_resolve_auto_prefers_manual_target_subs():
 
 def test_resolve_auto_falls_back_to_whisper():
     meta = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
-                     subtitles={"manual": ["en"], "auto": ["id"]})
+                     subtitles={"manual": [], "auto": ["id"]})
     assert resolve_transcript_source("auto", meta, "id") == "whisper"
     upload = VideoMeta(source_type="upload", project_id="p2", title="T", duration=100.0)
     assert resolve_transcript_source("auto", upload, "id") == "whisper"
@@ -121,17 +124,109 @@ def test_resolve_auto_falls_back_to_whisper():
 
 
 def test_explicit_youtube_source_without_target_subs_rejected():
-    meta = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
-                     subtitles={"manual": ["en"], "auto": ["en"]})
+    empty = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                      subtitles={"manual": [], "auto": []})
     with pytest.raises(AppError) as e1:
-        resolve_transcript_source("youtube_manual", meta, "id")
+        resolve_transcript_source("youtube_manual", empty, "id")
     assert e1.value.code == "VALIDATION"
     with pytest.raises(AppError) as e2:
-        resolve_transcript_source("youtube_auto", meta, "id")
+        resolve_transcript_source("youtube_auto", empty, "id")
     assert e2.value.code == "VALIDATION"
+    meta = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                     subtitles={"manual": ["en"], "auto": ["en"]})
+    assert resolve_transcript_source("youtube_manual", meta, "id") == "youtube_manual"
+    assert resolve_transcript_source("youtube_auto", meta, "id") == "youtube_auto"
     assert resolve_transcript_source("youtube_manual", meta, "en") == "youtube_manual"
     assert resolve_transcript_source("youtube_auto", meta, "en") == "youtube_auto"
     assert resolve_transcript_source("whisper", meta, "id") == "whisper"
+
+
+def test_plan_prefers_target_then_requested_source_then_english():
+    meta_all = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                         subtitles={"manual": ["ja", "en", "id"], "auto": []})
+    assert resolve_subtitle_plan("auto", meta_all, "id") == SubtitlePlan("youtube_manual", "id", False)
+
+    meta_ja_en = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                           subtitles={"manual": ["ja", "en"], "auto": []})
+    assert resolve_subtitle_plan("auto", meta_ja_en, "id") == SubtitlePlan("youtube_manual", "en", True)
+
+    meta_ja_th = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                           subtitles={"manual": ["ja", "th"], "auto": []})
+    assert resolve_subtitle_plan("auto", meta_ja_th, "id") == SubtitlePlan("youtube_manual", "ja", True)
+    assert resolve_subtitle_plan("auto", meta_ja_th, "id", source_language="th") == SubtitlePlan("youtube_manual", "th", True)
+    assert resolve_subtitle_plan("youtube_manual", meta_ja_th, "id", source_language="th") == SubtitlePlan(
+        "youtube_manual", "th", True
+    )
+
+    # Normalized match works and exact match is preferred when both exist
+    meta_region = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                            subtitles={"manual": ["en-US", "ja"], "auto": []})
+    assert resolve_subtitle_plan("auto", meta_region, "id") == SubtitlePlan("youtube_manual", "en-US", True)
+    assert resolve_subtitle_plan("auto", meta_region, "en") == SubtitlePlan("youtube_manual", "en-US", False)
+
+    meta_exact = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                           subtitles={"manual": ["en-US", "en", "ja"], "auto": []})
+    assert resolve_subtitle_plan("auto", meta_exact, "id") == SubtitlePlan("youtube_manual", "en", True)
+
+
+def test_plan_auto_never_picks_youtube_auto():
+    meta = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                     subtitles={"manual": [], "auto": ["id", "en"]})
+    assert resolve_subtitle_plan("auto", meta, "id") == SubtitlePlan("whisper", None, None)
+    assert resolve_subtitle_plan("auto", meta, "id", source_language="ko") == SubtitlePlan("whisper", "ko", None)
+
+
+def test_plan_auto_without_manual_subs_uses_whisper():
+    meta = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                     subtitles={"manual": [], "auto": []})
+    assert resolve_subtitle_plan("auto", meta, "id") == SubtitlePlan("whisper", None, None)
+    assert resolve_subtitle_plan("whisper", meta, "id", source_language="EN") == SubtitlePlan("whisper", "en", None)
+
+    upload = VideoMeta(source_type="upload", project_id="p2", title="T", duration=100.0)
+    assert resolve_subtitle_plan("auto", upload, "id", source_language="ko") == SubtitlePlan("whisper", None, None)
+    assert resolve_subtitle_plan("youtube_manual", upload, "id") == SubtitlePlan("whisper", None, None)
+
+
+def test_plan_explicit_youtube_auto_uses_spoken_language():
+    meta_ko = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                        subtitles={"manual": [], "auto": ["ko"]})
+    assert resolve_subtitle_plan("youtube_auto", meta_ko, "id") == SubtitlePlan("youtube_auto", "ko", True)
+
+    meta_both = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                          subtitles={"manual": [], "auto": ["ko", "id"]})
+    assert resolve_subtitle_plan("youtube_auto", meta_both, "id") == SubtitlePlan("youtube_auto", "id", False)
+
+
+def test_plan_explicit_sources_without_subs_rejected():
+    no_manual = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                          subtitles={"manual": [], "auto": ["id"]})
+    with pytest.raises(AppError) as e_m:
+        resolve_subtitle_plan("youtube_manual", no_manual, "id")
+    assert e_m.value.code == "VALIDATION" and e_m.value.status == 422
+
+    no_auto = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                        subtitles={"manual": ["id"], "auto": []})
+    with pytest.raises(AppError) as e_a:
+        resolve_subtitle_plan("youtube_auto", no_auto, "id")
+    assert e_a.value.code == "VALIDATION" and e_a.value.status == 422
+
+
+def test_resolve_transcript_source_still_returns_string():
+    meta_en = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                        subtitles={"manual": ["en"], "auto": []})
+    assert resolve_transcript_source("auto", meta_en, "id") == "youtube_manual"
+
+    meta_none = VideoMeta(source_type="youtube", project_id="p1", title="T", duration=100.0,
+                          subtitles={"manual": [], "auto": ["id"]})
+    assert resolve_transcript_source("auto", meta_none, "id") == "whisper"
+
+
+def test_distribute_words_public_and_legacy_alias():
+    words = distribute_words(["halo", "semuanya"], 1.0, 3.0, approx=True)
+    assert [w.w for w in words] == ["halo", "semuanya"]
+    assert words[0].start == 1.0 and words[1].end == 3.0
+    assert all(w.approx is True for w in words)
+    assert youtube_subs._distribute_words is distribute_words
 
 
 def test_transcript_dir_per_source(tmp_path):
@@ -370,10 +465,10 @@ def test_explicit_youtube_sub_source_validates_before_download(engine_and_settin
             assert download is False
             return {
                 "id": "dQw4w9WgXcQ",
-                "title": "Video Inggris",
+                "title": "Video Tanpa Sub",
                 "duration": 120.0,
                 "subtitles": {},
-                "automatic_captions": {"en-orig": [{"ext": "json3"}], "en": [{"ext": "json3"}], "id": [{"ext": "json3"}]},
+                "automatic_captions": {},
             }
 
         def download(self, urls):
@@ -390,8 +485,8 @@ def test_explicit_youtube_sub_source_validates_before_download(engine_and_settin
                           target_language="id")
     deps_m = ProcessDeps(
         settings=settings,
-        probe=lambda proj, s: VideoMeta(source_type="youtube", project_id=proj.id, title="Video Inggris",
-                                        duration=120.0, subtitles={"manual": ["en"], "auto": ["en"]}),
+        probe=lambda proj, s: VideoMeta(source_type="youtube", project_id=proj.id, title="Video Tanpa Manual",
+                                        duration=120.0, subtitles={"manual": [], "auto": ["en"]}),
         ingest=lambda *a, **kw: (_ for _ in ()).throw(AssertionError("ingest must not run")),
     )
     assert run_process_job(engine, jid_m, deps_m) == "done"
