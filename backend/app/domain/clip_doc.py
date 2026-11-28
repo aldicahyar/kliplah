@@ -61,7 +61,8 @@ class Overlay(BaseModel):
 def subtitles_from_m1(lines: list[SubtitleLine]) -> list[dict]:
     return [SubtitleLineV2(id=line.id, start=line.start, end=line.end, text=line.text, edited=line.edited,
                            source="whisper",
-                           words=[WordV2(w=w.w, start=w.start, end=w.end) for w in line.words]).model_dump()
+                           words=[WordV2(w=w.w, start=w.start, end=w.end, prob=w.prob, approx=w.approx)
+                                  for w in line.words]).model_dump()
             for line in lines]
 
 

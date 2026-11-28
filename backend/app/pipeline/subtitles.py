@@ -26,7 +26,8 @@ def load_presets(path: Path | None = None) -> dict:
 
 def group_lines(words: list[Word], clip_start: float, clip_end: float, max_words: int = 4,
                 gap: float = 0.4) -> list[SubtitleLine]:
-    inside = [Word(w=w.w, start=max(0.0, round(w.start - clip_start, 3)), end=round(min(w.end, clip_end) - clip_start, 3))
+    inside = [Word(w=w.w, start=max(0.0, round(w.start - clip_start, 3)),
+                   end=round(min(w.end, clip_end) - clip_start, 3), approx=w.approx, prob=w.prob)
               for w in words if w.end > clip_start + EPS and w.start < clip_end - EPS]
     lines: list[SubtitleLine] = []
     cur: list[Word] = []

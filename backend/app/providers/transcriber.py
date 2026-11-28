@@ -1,12 +1,18 @@
+import logging
 import wave
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 
+from app.core.errors import AppError
 from app.core.models import Word
+from app.domain.languages import LANGUAGE_ALIASES, LOW_CONFIDENCE_PROB, normalize_language
+
+log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
+MIN_DETECTION_WORDS = 10
 
 
 class Transcriber(Protocol):
@@ -31,10 +37,13 @@ def read_wav_chunk(wav: Path, start: float, end: float) -> np.ndarray:
 
 
 class FasterWhisperTranscriber:
-    """faster-whisper on CPU (int8), Indonesian, word timestamps, Silero VAD."""
+    """faster-whisper on CPU (int8), multilingual with detection, word timestamps, Silero VAD."""
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, language: str | None = None, target_language: str = "id"):
         self.model_name = model_name
+        self.language: str | None = normalize_language(language)
+        self.target_language: str = normalize_language(target_language) or "id"
+        self.language_probability: float | None = None
         self._model = None
 
     def _load_model(self):
@@ -44,17 +53,39 @@ class FasterWhisperTranscriber:
             self._model = WhisperModel(self.model_name, device="cpu", compute_type="int8")
         return self._model
 
+    def _lock_language(self, info) -> None:
+        raw_lang = getattr(info, "language", None)
+        raw_prob = getattr(info, "language_probability", None)
+        prob = float(raw_prob) if raw_prob is not None else None
+        self.language_probability = prob
+        try:
+            detected = normalize_language(raw_lang)
+        except AppError:
+            log.warning("Kode bahasa terdeteksi '%s' tidak dikenal; gunakan target '%s'.",
+                        raw_lang, self.target_language)
+            detected = None
+        aliases = LANGUAGE_ALIASES.get(self.target_language, frozenset())
+        if detected is None or prob is None or prob < LOW_CONFIDENCE_PROB or detected in aliases:
+            self.language = self.target_language
+        else:
+            self.language = detected
+
     def transcribe_chunk(self, wav: Path, start: float, end: float) -> list[Word]:
         piece = read_wav_chunk(wav, start, end)
         if len(piece) == 0:
             return []
-        segments, _ = self._load_model().transcribe(
-            piece, language="id", word_timestamps=True, vad_filter=True,
+        segments, info = self._load_model().transcribe(
+            piece, language=self.language, word_timestamps=True, vad_filter=True,
             condition_on_previous_text=False, beam_size=2)
         words: list[Word] = []
         for seg in segments:
             for w in seg.words or []:
                 text = w.word.strip()
                 if text:
-                    words.append(Word(w=text, start=round(start + w.start, 3), end=round(start + w.end, 3)))
+                    raw_prob = getattr(w, "probability", None)
+                    prob = round(float(raw_prob), 3) if raw_prob is not None else None
+                    words.append(Word(w=text, start=round(start + w.start, 3),
+                                      end=round(start + w.end, 3), prob=prob))
+        if self.language is None and len(words) >= MIN_DETECTION_WORDS and info is not None:
+            self._lock_language(info)
         return words

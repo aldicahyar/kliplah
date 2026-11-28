@@ -67,6 +67,28 @@ def test_transcribe_language_param(tmp_path):
     assert t.language == "en"
 
 
+def test_transcribe_labels_transcript_with_detected_language(tmp_path):
+    class DetectingTranscriber(FakeTranscriber):
+        def __init__(self):
+            super().__init__()
+            self.language: str | None = None
+
+        def transcribe_chunk(self, wav, start, end):
+            self.language = "en"
+            return super().transcribe_chunk(wav, start, end)
+
+    f = DetectingTranscriber()
+    t = transcribe(Path("a.wav"), 600, tmp_path, f, "small", [])
+    assert t.language == "en"
+    saved = json.loads((tmp_path / "transcript.json").read_text(encoding="utf-8"))
+    assert saved["language"] == "en"
+
+
+def test_transcribe_defaults_language_to_id_when_none(tmp_path):
+    t = transcribe(Path("a.wav"), 600, tmp_path, FakeTranscriber(), "small", [], language=None)
+    assert t.language == "id"
+
+
 def _rf(index, start, end):
     return RangeFile(index, start, end, f"source_r{index}.mp4")
 

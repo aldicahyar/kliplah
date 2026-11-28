@@ -46,6 +46,17 @@ def test_subtitles_from_m1_shape():
     assert SubtitleLineV2.model_validate(subs[0]).words[0].w == "halo"
 
 
+def test_subtitles_from_m1_copies_prob_and_approx():
+    line = SubtitleLine(
+        id=1, start=0.2, end=1.0, text="aku pergi",
+        words=[Word(w="aku", start=0.2, end=0.5, prob=0.35, approx=False),
+               Word(w="pergi", start=0.5, end=1.0, prob=None, approx=True)],
+    )
+    subs = subtitles_from_m1([line])
+    assert subs[0]["words"][0]["prob"] == 0.35 and subs[0]["words"][0]["approx"] is False
+    assert subs[0]["words"][1]["prob"] is None and subs[0]["words"][1]["approx"] is True
+
+
 def test_overlay_model():
     o = Overlay(id="o1", type="label", start=1.0, end=2.0, x=0.5, y=0.3, text="Wah")
     assert o.rotation == 0 and o.emoji is None and o.style == {}

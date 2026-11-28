@@ -12,6 +12,7 @@ from app.core.errors import AppError
 LANGUAGES_PATH = Path(__file__).resolve().parents[1] / "data" / "languages.json"
 
 LANGUAGE_ALIASES: dict[str, frozenset[str]] = {"id": frozenset({"ms"})}
+LOW_CONFIDENCE_PROB = 0.6
 
 _LANG_RE = re.compile(r"^[a-z]{2,3}(?:[-_][a-z0-9]+)*$")
 

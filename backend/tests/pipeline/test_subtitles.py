@@ -39,6 +39,16 @@ def test_group_lines_only_words_inside_clip():
     assert texts(lines) == ["mulai di"]
 
 
+def test_group_lines_preserves_prob_and_approx():
+    ws = [
+        Word(w="aku", start=1.0, end=1.3, prob=0.45, approx=False),
+        Word(w="pergi", start=1.3, end=1.6, prob=None, approx=True),
+    ]
+    lines = group_lines(ws, clip_start=0.5, clip_end=3.0)
+    assert len(lines) == 1
+    assert [(w.prob, w.approx) for w in lines[0].words] == [(0.45, False), (None, True)]
+
+
 def test_ass_color():
     assert ass_color("#FFE14D") == "&H004DE1FF"
 

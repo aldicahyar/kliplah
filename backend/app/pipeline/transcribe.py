@@ -20,7 +20,7 @@ def chunk_bounds(duration: float, chunk_sec: float = 600.0) -> list[tuple[float,
 
 def transcribe(wav: Path, duration: float, out_dir: Path, transcriber: Transcriber, model_name: str,
                corrections: list[tuple[str, str]],
-               on_progress: Callable[[float], None] | None = None, language: str = "id") -> Transcript:
+               on_progress: Callable[[float], None] | None = None, language: str | None = None) -> Transcript:
     """Transcribe one audio file; word times are local to that file."""
     final = out_dir / "transcript.json"
     cached = read_json(final)
@@ -41,7 +41,8 @@ def transcribe(wav: Path, duration: float, out_dir: Path, transcriber: Transcrib
             on_progress(round(b / duration, 4))
 
     words = apply_corrections(words, corrections)
-    t = Transcript(language=language, duration=duration, words=words, sentences=split_sentences(words))
+    used_lang = getattr(transcriber, "language", None) or language or "id"
+    t = Transcript(language=used_lang, duration=duration, words=words, sentences=split_sentences(words))
     atomic_write_json(final, t.model_dump())
     return t
 
