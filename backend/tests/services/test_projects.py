@@ -434,7 +434,7 @@ def test_probe_no_warning_for_claude_manual(engine, settings, monkeypatch):
 def test_probe_estimate_includes_translate_minutes_only_when_needed(engine, settings, monkeypatch):
     from app.core.models import VideoMeta
 
-    assert projects.TRANSLATE_SEC_PER_MIN == pytest.approx(20.0)
+    assert projects.TRANSLATE_SEC_PER_MIN == pytest.approx(190.0)
 
     meta_en = VideoMeta(
         source_type="youtube",
@@ -446,9 +446,9 @@ def test_probe_estimate_includes_translate_minutes_only_when_needed(engine, sett
     )
     monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta_en)
 
-    # 30 minutes (1800 s): translate_sec = (1800/60)*20 = 600s = 10m
+    # 30 minutes (1800 s): translate_sec = (1800/60)*190 = 5700s = 95m
     ollama_en = projects.probe(engine, URL, ranges=[[0, 1800]], moment_source="ollama", settings=settings)
-    assert ollama_en["estimate"]["breakdown"]["translate_min"] == 10
+    assert ollama_en["estimate"]["breakdown"]["translate_min"] == 95
     assert ollama_en["estimate"]["process_minutes"] == sum(ollama_en["estimate"]["breakdown"].values())
 
     claude_en = projects.probe(engine, URL, ranges=[[0, 1800]], moment_source="claude_manual", settings=settings)
@@ -464,7 +464,7 @@ def test_probe_estimate_includes_translate_minutes_only_when_needed(engine, sett
     ollama_wh_ko = projects.probe(
         engine, URL, ranges=[[0, 1800]], source_language="ko", moment_source="ollama", settings=settings
     )
-    assert ollama_wh_ko["estimate"]["breakdown"]["translate_min"] == 10
+    assert ollama_wh_ko["estimate"]["breakdown"]["translate_min"] == 95
 
 
 def test_probe_constants_calibrated(engine, settings, monkeypatch):
@@ -472,7 +472,7 @@ def test_probe_constants_calibrated(engine, settings, monkeypatch):
 
     assert projects.WHISPER_FACTOR == pytest.approx(0.85)
     assert projects.CHAT_SEC_PER_HOUR == pytest.approx(50.0)
-    assert projects.TRANSLATE_SEC_PER_MIN == pytest.approx(20.0)
+    assert projects.TRANSLATE_SEC_PER_MIN == pytest.approx(190.0)
 
     meta = VideoMeta(
         source_type="youtube",

@@ -2,7 +2,7 @@
 
 Aplikasi pribadi yang mengubah video panjang dari YouTube atau file lokal (podcast, stream, variety show, berita) menjadi klip vertikal 9:16 lengkap dengan hook dan subtitle, siap diunggah ke TikTok, Instagram Reels, dan YouTube Shorts. Semua proses berjalan **lokal** di laptop, tanpa GPU dan tanpa API berbayar. Momen menarik dipilih oleh Claude lewat langganan Anda sendiri (default) atau oleh model lokal lewat Ollama.
 
-Status: **S3 selesai (uji video asli menyusul): bahasa asing, terjemahan, & subtitle dua bahasa.** Backend sudah mendukung `probe`, unduhan per rentang waktu, cookies browser, subtitle YouTube lintas bahasa, Whisper multibahasa dengan deteksi bahasa otomatis dan keyakinan per kata (`prob`), terjemahan Indonesia lewat Ollama atau Claude manual (`export-translation` / `import-translation`), mode tampilan subtitle (`target`, `bilingual`, `original`), sinyal live chat + puncak suara, arahan `focus_prompt`, profil konten, dan model data v2. Website (review dan edit klip di browser) menyusul setelah tahap sistem S4.
+Status: **S3 selesai: bahasa asing, terjemahan, & subtitle dua bahasa.** Backend sudah mendukung `probe`, unduhan per rentang waktu, cookies browser, subtitle YouTube lintas bahasa, Whisper multibahasa dengan deteksi bahasa otomatis dan keyakinan per kata (`prob`), terjemahan Indonesia lewat Ollama atau Claude manual (`export-translation` / `import-translation`), mode tampilan subtitle (`target`, `bilingual`, `original`), sinyal live chat + puncak suara, arahan `focus_prompt`, profil konten, dan model data v2. Website (review dan edit klip di browser) menyusul setelah tahap sistem S4.
 
 ## Cara kerja singkat
 
@@ -143,7 +143,7 @@ Hasil render ada di `DATA_DIR/projects/<id>/clips/<clip_id>/`: `final.mp4` dan `
 ## Batas yang diketahui
 
 - **Transkrip campuran bahasa:** satu project memakai satu bahasa sumber (`source_language`), misalnya video berbahasa Indonesia yang menyelipkan frasa atau kalimat Inggris. Perbaikan kata/baris lewat kamus koreksi dan editor subtitle di browser ditunda ke W2.
-- **Uji video asli S3 (Step 4):** verifikasi end-to-end memakai video berbahasa Inggris asli serta kalibrasi konstanta perkiraan terjemahan (`TRANSLATE_SEC_PER_MIN`) masih menunggu video contoh dari pengguna.
+- **Kualitas terjemahan lokal pada bahasa tertentu:** uji video asli (Step 4, `qwen3:4b` CPU) menunjukkan bahasa dengan penanda `weak_local_translation` (`ko`, `ja`, `zh`, `th`) berjalan jauh lebih lambat (~3 menit proses per menit video, `TRANSLATE_SEC_PER_MIN = 190.0`) dan lebih rentan salah terjemah nama/makanan khas dibanding `claude_manual`; gunakan jalur Claude manual untuk kualitas terbaik.
 
 ## Pengujian
 

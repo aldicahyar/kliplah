@@ -618,7 +618,7 @@ def test_cli_probe_type_option(env, monkeypatch, capsys):
     out_stream = capsys.readouterr().out
     assert "Stream Korea" in out_stream
     assert "chat 5m" in out_stream
-    assert "terjemah 10m" in out_stream
+    assert "terjemah 95m" in out_stream
     assert "Peringatan:" in out_stream and "Claude" in out_stream and "medium" in out_stream
 
     assert cli.main([

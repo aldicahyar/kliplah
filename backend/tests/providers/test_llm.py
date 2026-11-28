@@ -3,7 +3,7 @@ import json
 import httpx
 import pytest
 
-from app.providers.llm import LLMUnavailable, OllamaClient
+from app.providers.llm import LLMTimeout, LLMUnavailable, OllamaClient
 
 
 def test_ollama_unavailable_raises():
@@ -50,3 +50,13 @@ def test_ollama_non_json_body_returns_empty_text():
     c = OllamaClient("http://ollama", "qwen3:4b",
                      transport=httpx.MockTransport(lambda r: httpx.Response(200, text="<html>proxy</html>")))
     assert c.complete_json("x", {}) == ""
+
+
+def test_ollama_timeout_raises_llm_timeout():
+    def timeout_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    c = OllamaClient("http://ollama", "qwen3:4b", transport=httpx.MockTransport(timeout_handler))
+    with pytest.raises(LLMTimeout) as exc:
+        c.complete_json("x", {})
+    assert isinstance(exc.value, LLMUnavailable)

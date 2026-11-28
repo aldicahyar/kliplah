@@ -7,6 +7,10 @@ class LLMUnavailable(Exception):
     """Ollama is not running, unreachable, or the model is not pulled."""
 
 
+class LLMTimeout(LLMUnavailable):
+    """Ollama responded too slowly and a single request exceeded its timeout."""
+
+
 class LLMClient(Protocol):
     def complete_json(self, prompt: str, schema: dict) -> str:
         """Raw model text for a prompt, constrained to a JSON schema."""
@@ -24,6 +28,8 @@ class OllamaClient:
                 "options": {"temperature": 0.3, "num_ctx": 8192}}
         try:
             r = self._http.post("/api/generate", json=body)
+        except httpx.TimeoutException as e:
+            raise LLMTimeout(f"Ollama melewati batas waktu respons: {e}") from e
         except httpx.TransportError as e:
             raise LLMUnavailable(f"Ollama tidak bisa dihubungi: {e}") from e
         if r.status_code == 404:

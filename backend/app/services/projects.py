@@ -38,7 +38,7 @@ CHAT_SEC_PER_HOUR = 50.0
 LLM_SEC_PER_WINDOW = 480.0
 LLM_WINDOW_SEC = 300.0
 LLM_SEC_PER_CLIP = 25.0
-TRANSLATE_SEC_PER_MIN = 20.0  # perkiraan awal, dikalibrasi di Task 12
+TRANSLATE_SEC_PER_MIN = 190.0  # kalibrasi uji nyata 2026-11-28 (i7-1355U tanpa GPU, qwen3:4b)
 
 
 def _breakdown_minutes(secs: dict[str, float]) -> tuple[int, dict[str, int]]:
