@@ -24,7 +24,7 @@ from app.domain.ranges import RangeFile, SourceMap
 from app.domain.style import effective_style, style_diff
 from app.domain.timeline import Piece, output_duration, output_to_source, remap_output_items
 from app.domain.translation import Translation, load_translation
-from app.pipeline.subtitle_lines import clip_subtitle_lines
+from app.pipeline.subtitle_lines import clip_subtitle_lines, resolve_subtitle_source
 from app.services._common import domain_errors, err, fetch
 from app.services.styles import clip_base_style
 from app.services.translation import needs_translation
@@ -36,7 +36,6 @@ RERENDER_FIELDS = ("pieces", "layout_segments", "style_override", "overlays", "s
 PLATFORMS = ("tiktok", "reels", "shorts")
 APPROVABLE = ("proposed", "rendered", "render_failed", "approved")
 RENDERABLE = ("approved", "rendered", "render_failed")
-_SUBTITLE_SOURCES = ("whisper", "youtube_manual", "youtube_auto")
 _EPS = 0.0005
 
 
@@ -57,10 +56,6 @@ def get_clip(engine: Engine, clip_id: str) -> Clip:
 
 
 # ---------- transcript-based subtitles ----------
-
-def _subtitle_source(project: Project) -> str:
-    """Resolve `SubtitleLineV2.source` from `project.transcript_source`, falling back to `whisper`."""
-    return project.transcript_source if project.transcript_source in _SUBTITLE_SOURCES else "whisper"
 
 
 def _transcript_loader(
@@ -85,7 +80,7 @@ def _transcript_loader(
                         if needs_translation(t.language, project.target_language)
                         else None
                     )
-                    cache[project_id] = (t, tr, _subtitle_source(project))
+                    cache[project_id] = (t, tr, resolve_subtitle_source(project.transcript_source))
         return cache[project_id]
 
     return load

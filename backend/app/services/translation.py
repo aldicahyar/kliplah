@@ -12,7 +12,7 @@ from app.core.fs import atomic_write_json, read_json
 from app.core.models import Sentence, Transcript
 from app.db.engine import session_scope
 from app.db.tables import Clip, Project, utcnow
-from app.domain.languages import language_name, normalize_language
+from app.domain.languages import language_name, safe_normalize_language
 from app.domain.style import effective_style
 from app.domain.translation import (
     Translation,
@@ -22,27 +22,17 @@ from app.domain.translation import (
     save_translation,
 )
 from app.pipeline.llm_json import parse_llm_json
-from app.pipeline.subtitle_lines import clip_subtitle_lines
+from app.pipeline.subtitle_lines import clip_subtitle_lines, resolve_subtitle_source
 from app.pipeline.subtitles import EPS
 from app.services._common import err, fetch
 from app.worker.process import transcript_dir
 
 PART_LINES = 300
-_SUBTITLE_SOURCES = ("whisper", "youtube_manual", "youtube_auto")
-
-
-def _norm_lang(code: str | None) -> str:
-    if not code:
-        return ""
-    try:
-        return normalize_language(code) or code.strip().lower()
-    except AppError:
-        return code.strip().lower()
 
 
 def needs_translation(source_language: str | None, target_language: str | None) -> bool:
     """Return True when the transcript language differs from the normalized target language."""
-    return _norm_lang(source_language) != _norm_lang(target_language)
+    return (safe_normalize_language(source_language) or "") != (safe_normalize_language(target_language) or "")
 
 
 def _load_project_transcript(session: Session, project_id: str, settings: Settings) -> tuple[Project, Path, Transcript]:
@@ -279,6 +269,13 @@ def _rebuild_clip_subtitles(
     return out
 
 
+def _subs_equal(a: list[dict], b: list[dict]) -> bool:
+    """Compare subtitle payloads ignoring line `id` numbering (0-based manual/gap-fill vs 1-based)."""
+    return [{k: v for k, v in x.items() if k != "id"} for x in a] == [
+        {k: v for k, v in x.items() if k != "id"} for x in b
+    ]
+
+
 def refresh_clip_subtitles(
     engine: Engine,
     project_id: str,
@@ -295,11 +292,7 @@ def refresh_clip_subtitles(
             if needs_translation(t.language, project.target_language)
             else None
         )
-        source = (
-            project.transcript_source
-            if project.transcript_source in _SUBTITLE_SOURCES
-            else "whisper"
-        )
+        source = resolve_subtitle_source(project.transcript_source)
         clips = list(
             session.exec(
                 select(Clip).where(Clip.project_id == project_id).order_by(Clip.rank, Clip.created_at)
@@ -319,10 +312,11 @@ def refresh_clip_subtitles(
             new_subs = _rebuild_clip_subtitles(
                 t, tr, project_id, clip.pieces or [], words_per_line, source
             )
-            clip.subtitles = new_subs
-            if clip.status == "rendered" and new_subs != old_subs:
-                clip.needs_rerender = True
-            clip.updated_at = utcnow()
-            session.add(clip)
+            if not _subs_equal(old_subs, new_subs):
+                clip.subtitles = new_subs
+                if clip.status == "rendered":
+                    clip.needs_rerender = True
+                clip.updated_at = utcnow()
+                session.add(clip)
             refreshed.append(clip.id)
     return refreshed, skipped

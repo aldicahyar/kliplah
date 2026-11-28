@@ -22,7 +22,7 @@ from app.core.fs import atomic_write_json, project_dir, read_json
 from app.core.models import Candidate, Materials, Sentence, Transcript, VideoMeta, Word
 from app.db.engine import get_engine, session_scope
 from app.db.tables import Job, Project, utcnow
-from app.domain.languages import normalize_language
+from app.domain.languages import safe_normalize_language
 from app.domain.profiles import profile_for
 from app.domain.ranges import RangeFile, SourceMap
 from app.domain.translation import load_translation, merge_lines, missing_sentences, save_translation, translated_view
@@ -215,15 +215,6 @@ class ProcessDeps:
     prepare: Callable[[Engine, str, list[Pick]], None] = default_prepare
 
 
-def _norm_lang(code: str | None) -> str:
-    if not code:
-        return ""
-    try:
-        return normalize_language(code) or code.strip().lower()
-    except AppError:
-        return code.strip().lower()
-
-
 def to_app_error(e: Exception) -> AppError:
     if isinstance(e, AppError):
         return e
@@ -402,7 +393,9 @@ class _Run:
 
     @property
     def needs_translation(self) -> bool:
-        return _norm_lang(self.transcript.language) != _norm_lang(self.project.target_language)
+        return (safe_normalize_language(self.transcript.language) or "") != (
+            safe_normalize_language(self.project.target_language) or ""
+        )
 
     def stage_translate(self) -> None:
         if self.project.moment_source != "ollama" or not self.needs_translation:

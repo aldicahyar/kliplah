@@ -10,7 +10,7 @@ from yt_dlp.utils import DownloadError
 from app.core.config import Settings
 from app.core.errors import AppError
 from app.core.models import VideoMeta, Word
-from app.domain.languages import normalize_language
+from app.domain.languages import safe_normalize_language
 from app.domain.ranges import RangeFile
 from app.pipeline.ingest import _map_download_error, _watch_url, ytdl_base_opts
 
@@ -55,16 +55,6 @@ def distribute_words(toks: list[str], start: float, end: float, *, approx: bool)
 _distribute_words = distribute_words
 
 
-def _safe_norm(code: str | None) -> str | None:
-    if code is None:
-        return None
-    try:
-        return normalize_language(code)
-    except AppError:
-        cleaned = code.strip().lower()
-        return cleaned or None
-
-
 def _match_lang(langs: list[str], raw: str | None, norm: str | None) -> str | None:
     if raw and raw in langs:
         return raw
@@ -73,7 +63,7 @@ def _match_lang(langs: list[str], raw: str | None, norm: str | None) -> str | No
     if norm in langs:
         return norm
     for code in sorted(langs):
-        if _safe_norm(code) == norm:
+        if safe_normalize_language(code) == norm:
             return code
     return None
 
@@ -96,8 +86,8 @@ def resolve_subtitle_plan(requested: str, meta: VideoMeta, target_language: str,
     if meta.source_type == "upload":
         return SubtitlePlan("whisper", None, None)
 
-    norm_target = _safe_norm(target_language) or "id"
-    norm_source = _safe_norm(source_language)
+    norm_target = safe_normalize_language(target_language) or "id"
+    norm_source = safe_normalize_language(source_language)
     if requested == "whisper":
         return SubtitlePlan("whisper", norm_source, None)
 
@@ -110,12 +100,12 @@ def resolve_subtitle_plan(requested: str, meta: VideoMeta, target_language: str,
                 return SubtitlePlan("whisper", norm_source, None)
             raise AppError("VALIDATION", "Subtitle resmi YouTube tidak tersedia untuk video ini.", status=422)
         chosen = _pick_manual_lang(manual, target_language, norm_target, source_language, norm_source)
-        return SubtitlePlan("youtube_manual", chosen, (_safe_norm(chosen) or chosen) != norm_target)
+        return SubtitlePlan("youtube_manual", chosen, (safe_normalize_language(chosen) or chosen) != norm_target)
 
     if not auto:
         raise AppError("VALIDATION", "Subtitle otomatis YouTube tidak tersedia untuk video ini.", status=422)
     chosen = _match_lang(auto, target_language, norm_target) or sorted(auto)[0]
-    return SubtitlePlan("youtube_auto", chosen, (_safe_norm(chosen) or chosen) != norm_target)
+    return SubtitlePlan("youtube_auto", chosen, (safe_normalize_language(chosen) or chosen) != norm_target)
 
 
 def resolve_transcript_source(requested: str, meta: VideoMeta, target_language: str,

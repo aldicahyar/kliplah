@@ -447,3 +447,22 @@ def test_refresh_skips_rendering_clips(engine, settings):
         assert c_rendering.subtitles == orig_subs
         assert c_rendering.needs_rerender is False
 
+
+def test_refresh_does_not_trigger_rerender_for_0_based_unchanged_subtitles(engine, settings):
+    t = _english_transcript(4, each=6.0)
+    pid, _tdir = _setup_project(engine, settings, t, transcript_source="whisper")
+    # Simulate clips.create_manual / _renumber producing 0-based subtitle ids
+    zero_based = clip_subtitle_lines(t, None, 0.0, 6.0, max_words=4, source="whisper")
+    for idx, line in enumerate(zero_based):
+        line["id"] = idx
+    cid = _add_clip(
+        engine, pid, [{"project_id": pid, "start": 0.0, "end": 6.0}], zero_based, rank=1, status="rendered"
+    )
+
+    # Refresh triggered when an unrelated sentence (2) is translated; sentence 0 content did not change
+    import_translation(engine, pid, 1, '{"lines": [{"n": 2, "text": "kalimat lain"}]}', settings=settings)
+    with Session(engine) as s:
+        c = s.get(Clip, cid)
+        assert c.needs_rerender is False
+        assert c.subtitles == zero_based
+

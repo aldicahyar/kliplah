@@ -52,6 +52,16 @@ def normalize_language(code: str | None) -> str | None:
     return base
 
 
+def safe_normalize_language(code: str | None) -> str | None:
+    """Normalize a language code without raising; unknown codes fall back to trimmed lowercase."""
+    if code is None:
+        return None
+    try:
+        return normalize_language(code)
+    except AppError:
+        return code.strip().lower() or None
+
+
 def _lookup(code: str) -> Language | None:
     try:
         norm = normalize_language(code)

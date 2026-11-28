@@ -13,7 +13,12 @@ from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.db.engine import session_scope
 from app.db.tables import Clip, Job, Project, StyleTemplate, utcnow
-from app.domain.languages import is_weak_local_translation, language_name, normalize_language
+from app.domain.languages import (
+    is_weak_local_translation,
+    language_name,
+    normalize_language,
+    safe_normalize_language,
+)
 from app.domain.profiles import profile_for
 from app.domain.ranges import normalize_ranges
 from app.pipeline.ingest import IngestError, parse_youtube_id, probe_youtube
@@ -82,17 +87,9 @@ def _normalize_target(target_language: Any) -> str:
     with domain_errors("target_language"):
         if target_language is not None and not isinstance(target_language, str):
             raise err("VALIDATION", "Bahasa target harus berupa teks.")
+        if isinstance(target_language, str) and target_language.strip().lower() == "auto":
+            raise err("VALIDATION", "Bahasa target tidak boleh 'auto'.")
         return normalize_language(target_language) or "id"
-
-
-def _safe_norm(code: str | None) -> str | None:
-    if code is None:
-        return None
-    try:
-        return normalize_language(code)
-    except AppError:
-        cleaned = code.strip().lower()
-        return cleaned or None
 
 
 def _probe_warnings(effective_dur: float, plan, cand_lang: str | None, needs_tr: bool,
@@ -138,7 +135,7 @@ def probe(engine: Engine, url: str, *, ranges: list | None = None, source_langua
     norm = normalize_ranges(ranges, meta.duration or None)
     effective_dur = sum(e - s for s, e in norm) if norm else meta.duration
     plan = resolve_subtitle_plan("auto", meta, norm_target, source_language=norm_source)
-    cand_lang = _safe_norm(plan.language) or norm_source or _safe_norm(meta.language)
+    cand_lang = safe_normalize_language(plan.language) or norm_source or safe_normalize_language(meta.language)
     needs_tr = (
         plan.needs_translation
         if plan.needs_translation is not None

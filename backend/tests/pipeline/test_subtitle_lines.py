@@ -158,3 +158,15 @@ def test_clip_subtitle_lines_rounds_line_bounds_against_float_overshoot():
     lines = clip_subtitle_lines(t, tr, 0.1, 1.0, max_words=4)
     assert [line["text_original"] for line in lines] == ["zero", "first second"]
 
+
+def test_resolve_subtitle_source():
+    from app.pipeline.subtitle_lines import resolve_subtitle_source
+
+    assert resolve_subtitle_source("youtube_manual") == "youtube_manual"
+    assert resolve_subtitle_source("youtube_auto") == "youtube_auto"
+    assert resolve_subtitle_source("whisper") == "whisper"
+    assert resolve_subtitle_source("auto", "youtube_manual") == "youtube_manual"
+    assert resolve_subtitle_source("auto", "auto") == "whisper"
+    assert resolve_subtitle_source("auto", None) == "whisper"
+    assert resolve_subtitle_source(None, None) == "whisper"
+

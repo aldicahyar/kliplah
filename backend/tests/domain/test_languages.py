@@ -7,6 +7,7 @@ from app.domain.languages import (
     language_name,
     load_languages,
     normalize_language,
+    safe_normalize_language,
 )
 
 REQUIRED_CODES = {
@@ -57,3 +58,14 @@ def test_language_names_and_weak_flags():
 
     for strong_code in ("id", "ms", "en", "vi", "tl", "es", "fr", "de", "pt"):
         assert is_weak_local_translation(strong_code) is False
+
+
+def test_safe_normalize_language():
+    assert safe_normalize_language(None) is None
+    assert safe_normalize_language("") is None
+    assert safe_normalize_language("auto") is None
+    assert safe_normalize_language("pt-BR") == "pt"
+    assert safe_normalize_language("ko-orig") == "ko"
+    assert safe_normalize_language("  TL-PH  ") == "tl"
+    assert safe_normalize_language("  XX-Unlisted  ") == "xx-unlisted"
+    assert safe_normalize_language("   ") is None

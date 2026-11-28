@@ -369,6 +369,15 @@ def test_probe_reports_subtitle_plan_and_translation_engine(engine, settings, mo
         projects.create_project(engine, url=URL, target_language="xx", settings=settings)
     assert e_create_tgt.value.code == "VALIDATION" and e_create_tgt.value.status == 422
 
+    for tgt in ("auto", "AUTO"):
+        with pytest.raises(AppError) as e_auto_probe:
+            projects.probe(engine, URL, target_language=tgt, settings=settings)
+        assert e_auto_probe.value.code == "VALIDATION" and e_auto_probe.value.status == 422
+
+        with pytest.raises(AppError) as e_auto_create:
+            projects.create_project(engine, url=URL, target_language=tgt, settings=settings)
+        assert e_auto_create.value.code == "VALIDATION" and e_auto_create.value.status == 422
+
 
 def test_probe_warns_weak_local_translation_for_korean_with_ollama(engine, settings, monkeypatch):
     from app.core.models import VideoMeta

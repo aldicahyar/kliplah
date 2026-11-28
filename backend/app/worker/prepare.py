@@ -28,7 +28,7 @@ from app.domain.timeline import Piece
 from app.domain.translation import Translation, load_translation, merge_lines, missing_sentences, save_translation
 from app.pipeline.reframe import reframe_clip
 from app.pipeline.snap import neighbor_bounds, snap_edges
-from app.pipeline.subtitle_lines import clip_subtitle_lines
+from app.pipeline.subtitle_lines import clip_subtitle_lines, resolve_subtitle_source
 from app.pipeline.subtitles import EPS
 from app.providers.llm import LLMUnavailable
 from app.services.translation import needs_translation
@@ -39,7 +39,6 @@ log = logging.getLogger(__name__)
 SNAP_SLACK = 3.0  # edge refinement may stretch a clip slightly past max_sec (same as M1)
 THUMB_WIDTH = 360
 PROXY_HEIGHT = 480
-_SUBTITLE_SOURCES = ("whisper", "youtube_manual", "youtube_auto")
 
 
 def make_thumbnail(src: Path, t: float, out: Path) -> None:
@@ -83,15 +82,6 @@ def _load(d: Path, tdir: Path) -> tuple[VideoMeta, Transcript, list[tuple[float,
     if meta is None or transcript is None or silences is None:
         raise AppError("INVALID_STATE", "Data video, transkrip, atau jeda tidak ditemukan; proses ulang project ini.")
     return VideoMeta.model_validate(meta), Transcript.model_validate(transcript), [tuple(s) for s in silences]
-
-
-def _subtitle_source(project_source: str, meta_source: str | None) -> str:
-    """Resolve `SubtitleLineV2.source` from project/meta transcript_source, falling back to `whisper`."""
-    if project_source in _SUBTITLE_SOURCES:
-        return project_source
-    if meta_source in _SUBTITLE_SOURCES:
-        return meta_source
-    return "whisper"
 
 
 def _overlapping_sentence_indices(sentences: list[Sentence], spans: list[tuple[float, float]]) -> set[int]:
@@ -180,7 +170,7 @@ def build_clips_from_picks(engine: Engine, project_id: str, picks: list[Pick], d
     d = project_dir(deps.settings, project_id)
     meta, t, silences = _load(d, tdir)
     smap = SourceMap.from_meta(meta, d, t)
-    sub_source = _subtitle_source(project_source, meta.transcript_source)
+    sub_source = resolve_subtitle_source(project_source, meta.transcript_source)
 
     by_time = sorted(picks, key=lambda p: p[0].start)
     spans = [(c.start, c.end) for c, _ in by_time]

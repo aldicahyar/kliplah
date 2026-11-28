@@ -4,6 +4,17 @@ from app.domain.clip_doc import subtitles_from_m1
 from app.domain.translation import Translation, original_text_between, translated_view
 from app.pipeline.subtitles import EPS, group_lines
 
+SUBTITLE_SOURCES = ("whisper", "youtube_manual", "youtube_auto")
+
+
+def resolve_subtitle_source(project_source: str | None, meta_source: str | None = None) -> str:
+    """Resolve ``SubtitleLineV2.source`` from project/meta transcript_source, falling back to ``whisper``."""
+    if project_source in SUBTITLE_SOURCES:
+        return project_source
+    if meta_source in SUBTITLE_SOURCES:
+        return meta_source
+    return "whisper"
+
 
 def _has_translated_overlap(sentences: list[Sentence], tr: Translation, line_start: float, line_end: float) -> bool:
     for s in sentences:

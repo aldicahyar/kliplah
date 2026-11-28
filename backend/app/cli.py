@@ -3,7 +3,8 @@
 Every command writes to `DATA_DIR/kliplah.db` and runs its jobs synchronously through the worker
 (`worker_main(once=True)` until the project's queue is empty). `--queue-only` only enqueues.
 
-    python -m app.cli run <youtube-url | video-file> [--moments ollama|claude] [--no-render]
+    python -m app.cli probe <youtube-url> [--type ...] [--source-language KODE]
+    python -m app.cli run <youtube-url | video-file> [--source-language KODE] [--target-language KODE] [--moments ollama|claude] [--no-render]
     python -m app.cli analyze <project_id> --llm-model gemma3:4b
     python -m app.cli bench-whisper <youtube-url | video-file> --models small medium --seconds 300
     python -m app.cli migrate-m1
@@ -13,6 +14,8 @@ Without Ollama, using Claude through your own subscription (no API cost):
     python -m app.cli export-transcript <youtube-url | video-file>        # writes untuk_claude*.md
     python -m app.cli export-moments <project_id>                         # export again, same project
     python -m app.cli import-moments <project_id> <reply.json> [--part K]   # uses Claude's picks
+    python -m app.cli export-translation <project_id> [--scope clips|all] # writes terjemahan_claude*.md
+    python -m app.cli import-translation <project_id> <reply.json> [--part K]
 
 Jobs run here claim only this project's jobs and never reset another worker's `running` job: while
 `scripts/dev.py` is working on the project, the CLI waits for it.
