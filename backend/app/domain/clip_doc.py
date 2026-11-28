@@ -72,7 +72,6 @@ def _ignored_fields(style: dict, clip: Clip) -> list[str]:
         "subtitle.position.anchor": sub["position"]["anchor"] != "bottom",
         "subtitle.box": sub["box"]["enabled"],
         "subtitle.speaker_emoji": sub["speaker_emoji"],
-        "subtitle.language_mode": sub["language_mode"] != "target",
         "hook.position.anchor": hook["position"]["anchor"] != "top",
         "hook.box": hook["box"]["enabled"],
         "logo": style["logo"] is not None and style["logo"]["enabled"],
@@ -102,14 +101,35 @@ def _presets(style: dict) -> tuple[str, dict]:
     }
 
 
-def _m1_lines(subtitles: list[dict], uppercase: bool) -> list[SubtitleLine]:
+def _m1_line(line: SubtitleLineV2, uppercase: bool, language_mode: str) -> SubtitleLine:
     def up(s: str) -> str:
         return s.upper() if uppercase else s
 
-    lines = [SubtitleLineV2.model_validate(s) for s in subtitles]
-    return [SubtitleLine(id=line.id, start=line.start, end=line.end, text=up(line.text), edited=line.edited,
-                         words=[Word(w=up(w.w), start=w.start, end=w.end) for w in line.words])
-            for line in lines]
+    orig_src = line.text_original if (line.text_original and line.text_original.strip()) else None
+    if language_mode == "original":
+        shown = up(orig_src) if orig_src else up(line.text)
+        orig = None
+    elif language_mode == "bilingual":
+        shown = up(line.text)
+        orig = up(orig_src) if orig_src else None
+    else:
+        shown = up(line.text)
+        orig = None
+
+    # Highlight-word mode relies on exact per-word timing, so approx or non-target modes fall back to whole-line.
+    has_approx = any(w.approx for w in line.words)
+    words = (
+        []
+        if (has_approx or language_mode != "target")
+        else [Word(w=up(w.w), start=w.start, end=w.end, approx=w.approx, prob=w.prob) for w in line.words]
+    )
+    return SubtitleLine(
+        id=line.id, start=line.start, end=line.end, text=shown, words=words, edited=line.edited, original=orig
+    )
+
+
+def _m1_lines(subtitles: list[dict], uppercase: bool, language_mode: str = "target") -> list[SubtitleLine]:
+    return [_m1_line(SubtitleLineV2.model_validate(s), uppercase, language_mode) for s in subtitles]
 
 
 def _caption(captions: dict, key: str) -> PlatformCaption:
@@ -133,7 +153,7 @@ def to_clip_plan(clip: Clip, project_style: dict) -> tuple[ClipPlan, dict]:
     sub, hook = style["subtitle"], style["hook"]
     hook_text = clip.hook_text if hook["enabled"] else ""
     hook_duration = output_duration(pieces) if hook["duration"] == "full" else float(hook["duration"])
-    subtitles = _m1_lines(clip.subtitles, sub["uppercase"]) if sub["enabled"] else []
+    subtitles = _m1_lines(clip.subtitles, sub["uppercase"], sub["language_mode"]) if sub["enabled"] else []
 
     piece = pieces[0]
     candidate = Candidate(start_sentence=0, end_sentence=0, start=piece.start, end=piece.end,

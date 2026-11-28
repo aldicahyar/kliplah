@@ -155,3 +155,140 @@ def test_render_adapter_matches_m1_ass(mode, m1_preset):
     adapter_ass = build_ass(plan.subtitles, plan.materials.hook, plan.hook_duration_sec, plan.caption_preset, presets)
     m1_ass = build_ass(M1_LINES, "Ini rahasianya", 3.0, m1_preset, load_presets())
     assert adapter_ass == m1_ass
+
+
+def _translated_subtitles() -> list[dict]:
+    return [
+        {
+            "id": 1,
+            "start": 0.2,
+            "end": 1.4,
+            "text": "halo semua",
+            "edited": False,
+            "source": "translated",
+            "text_original": "hello everyone",
+            "speaker_emoji": None,
+            "words": [
+                {"w": "halo", "start": 0.2, "end": 0.8, "prob": None, "approx": True},
+                {"w": "semua", "start": 0.8, "end": 1.4, "prob": None, "approx": True},
+            ],
+        },
+        {
+            "id": 2,
+            "start": 1.6,
+            "end": 2.4,
+            "text": "tanpa terjemahan",
+            "edited": False,
+            "source": "whisper",
+            "text_original": None,
+            "speaker_emoji": None,
+            "words": [
+                {"w": "tanpa", "start": 1.6, "end": 2.0, "prob": 0.9, "approx": False},
+                {"w": "terjemahan", "start": 2.0, "end": 2.4, "prob": 0.88, "approx": False},
+            ],
+        },
+    ]
+
+
+@pytest.mark.parametrize("mode,m1_preset", [("line", "klasik"), ("highlight_word", "sorot_kata")])
+def test_target_mode_ass_matches_m1(mode, m1_preset):
+    project_style = deep_merge(default_style(), M1_LIKE)
+    clip = make_clip(style_override={"subtitle": {"mode": mode, "language_mode": "target"}})
+    plan, presets = to_clip_plan(clip, project_style)
+    adapter_ass = build_ass(plan.subtitles, plan.materials.hook, plan.hook_duration_sec, plan.caption_preset, presets)
+    m1_ass = build_ass(M1_LINES, "Ini rahasianya", 3.0, m1_preset, load_presets())
+    assert adapter_ass == m1_ass
+
+
+def test_bilingual_mode_puts_original_above_translation():
+    clip = make_clip(
+        subtitles=_translated_subtitles(),
+        style_override={"subtitle": {"language_mode": "bilingual", "mode": "highlight_word"}},
+    )
+    plan, presets = to_clip_plan(clip, default_style())
+    assert plan.subtitles[0].text == "halo semua"
+    assert plan.subtitles[0].original == "hello everyone"
+    assert plan.subtitles[0].words == []
+    assert plan.subtitles[1].text == "tanpa terjemahan"
+    assert plan.subtitles[1].original is None
+    assert plan.subtitles[1].words == []
+
+    ass = build_ass(plan.subtitles, plan.materials.hook, plan.hook_duration_sec, plan.caption_preset, presets)
+    subs = [l for l in ass.splitlines() if l.startswith("Dialogue") and ",Sub," in l]
+    assert len(subs) == 2
+    assert r"{\fs75}hello everyone{\r}\Nhalo semua" in subs[0]
+    assert subs[0].index("hello everyone") < subs[0].index(r"\N") < subs[0].index("halo semua")
+    assert subs[1].endswith(",tanpa terjemahan")
+
+    clip_upper = make_clip(
+        subtitles=_translated_subtitles(),
+        style_override={"subtitle": {"language_mode": "bilingual", "uppercase": True}},
+    )
+    plan_upper, presets_upper = to_clip_plan(clip_upper, default_style())
+    assert plan_upper.subtitles[0].text == "HALO SEMUA"
+    assert plan_upper.subtitles[0].original == "HELLO EVERYONE"
+    ass_upper = build_ass(
+        plan_upper.subtitles,
+        plan_upper.materials.hook,
+        plan_upper.hook_duration_sec,
+        plan_upper.caption_preset,
+        presets_upper,
+    )
+    assert r"{\fs75}HELLO EVERYONE{\r}\NHALO SEMUA" in ass_upper
+
+
+def test_original_mode_uses_text_original_with_fallback_to_text():
+    subs_data = _translated_subtitles() + [
+        {
+            "id": 3,
+            "start": 2.6,
+            "end": 3.2,
+            "text": "teks kosong",
+            "edited": False,
+            "source": "translated",
+            "text_original": "   ",
+            "speaker_emoji": None,
+            "words": [{"w": "teks", "start": 2.6, "end": 2.9, "approx": True},
+                      {"w": "kosong", "start": 2.9, "end": 3.2, "approx": True}],
+        }
+    ]
+    clip = make_clip(
+        subtitles=subs_data,
+        style_override={"subtitle": {"language_mode": "original", "mode": "highlight_word"}},
+    )
+    plan, _ = to_clip_plan(clip, default_style())
+    assert [l.text for l in plan.subtitles] == ["hello everyone", "tanpa terjemahan", "teks kosong"]
+    assert all(l.original is None for l in plan.subtitles)
+    assert all(l.words == [] for l in plan.subtitles)
+
+    clip_upper = make_clip(
+        subtitles=subs_data,
+        style_override={"subtitle": {"language_mode": "original", "uppercase": True}},
+    )
+    plan_upper, _ = to_clip_plan(clip_upper, default_style())
+    assert [l.text for l in plan_upper.subtitles] == ["HELLO EVERYONE", "TANPA TERJEMAHAN", "TEKS KOSONG"]
+
+
+def test_highlight_mode_falls_back_to_whole_line_for_approx_words():
+    clip = make_clip(
+        subtitles=_translated_subtitles(),
+        style_override={"subtitle": {"mode": "highlight_word", "language_mode": "target"}},
+    )
+    plan, presets = to_clip_plan(clip, default_style())
+    assert plan.subtitles[0].words == []
+    assert [w.w for w in plan.subtitles[1].words] == ["tanpa", "terjemahan"]
+
+    ass = build_ass(plan.subtitles, plan.materials.hook, plan.hook_duration_sec, plan.caption_preset, presets)
+    subs = [l for l in ass.splitlines() if l.startswith("Dialogue") and ",Sub," in l]
+    assert len(subs) == 3  # 1 whole line for approx line + 2 per-word highlights for non-approx line
+    assert subs[0].endswith(",halo semua")
+    assert r"{\c&H004DE1FF&}" not in subs[0]
+    assert r"{\c&H004DE1FF&}tanpa{\r} terjemahan" in subs[1]
+    assert r"tanpa {\c&H004DE1FF&}terjemahan{\r}" in subs[2]
+
+
+@pytest.mark.parametrize("lang_mode", ["bilingual", "original"])
+def test_language_mode_no_longer_warned_as_ignored(caplog, lang_mode):
+    with caplog.at_level(logging.WARNING, logger="app.domain.clip_doc"):
+        to_clip_plan(make_clip(style_override={"subtitle": {"language_mode": lang_mode}}), default_style())
+    assert caplog.records == []

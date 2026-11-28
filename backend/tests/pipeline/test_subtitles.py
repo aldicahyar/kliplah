@@ -95,3 +95,48 @@ def test_sorot_kata_one_event_per_word():
     assert all(s.count("{\\c&H004DE1FF&}") == 1 for s in subs)
     assert subs[1].endswith("aku {\\c&H004DE1FF&}setuju{\\r} banget")
     assert ",0:00:01.30,0:00:01.60,Sub," in subs[1]
+
+
+def test_bilingual_ass_renders_original_above_translation():
+    from app.pipeline.subtitles import ORIGINAL_FONT_SCALE
+
+    assert ORIGINAL_FONT_SCALE == pytest.approx(0.72)
+    presets = load_presets()
+    presets = {
+        **presets,
+        "presets": {k: {**v, "size": 104} for k, v in presets["presets"].items()},
+    }
+    words = [Word(w="halo", start=0.5, end=1.0), Word(w="semua", start=1.0, end=2.0)]
+    bilingual = SubtitleLine(id=1, start=0.5, end=2.0, text="halo semua", words=words, original="hello everyone")
+    plain = SubtitleLine(id=1, start=0.5, end=2.0, text="halo semua", words=words)
+
+    for preset in ("klasik", "sorot_kata"):
+        ass = build_ass([bilingual], "", 3.0, preset, presets)
+        subs = [l for l in ass.splitlines() if l.startswith("Dialogue") and ",Sub," in l]
+        assert len(subs) == 1
+        assert subs[0].endswith(r",{\fs75}hello everyone{\r}\Nhalo semua")
+        assert build_ass([SubtitleLine(id=1, start=0.5, end=2.0, text="halo semua", words=words, original=None)],
+                         "", 3.0, preset, presets) == build_ass([plain], "", 3.0, preset, presets)
+
+
+def test_bilingual_ass_sanitizes_both_lines():
+    presets = load_presets()
+    presets = {
+        **presets,
+        "presets": {k: {**v, "size": 104} for k, v in presets["presets"].items()},
+    }
+    line = SubtitleLine(
+        id=1,
+        start=0.0,
+        end=1.5,
+        text="teks {\\b1} \\N \\akhir\nbaris",
+        words=[Word(w="teks", start=0.0, end=1.5)],
+        original="asli {tag} \\N \\awal\nsatu",
+    )
+    for preset in ("klasik", "sorot_kata"):
+        ass = build_ass([line], "", 3.0, preset, presets)
+        subs = [l for l in ass.splitlines() if l.startswith("Dialogue") and ",Sub," in l]
+        assert len(subs) == 1
+        payload = subs[0].split(",", 9)[9]
+        assert payload == r"{\fs75}asli tag /N /awal satu{\r}\Nteks /b1 /N /akhir baris"
+        assert "{\\b1}" not in payload and "{tag}" not in payload

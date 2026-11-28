@@ -95,6 +95,7 @@ class SubtitleLine(BaseModel):
     text: str
     words: list[Word]
     edited: bool = False
+    original: str | None = None
 
 
 class ReframeSegment(BaseModel):

@@ -13,6 +13,7 @@ from app.core.models import SubtitleLine, Word
 CONNECTORS = {"dan", "tapi", "karena", "yang", "jadi"}
 LINE_BREAK_PUNCT = (".", "?", "!", ",")
 EPS = 1e-6
+ORIGINAL_FONT_SCALE = 0.72
 
 
 @lru_cache
@@ -104,7 +105,12 @@ def build_ass(lines: list[SubtitleLine], hook: str, hook_duration: float, preset
         out.append(f"Dialogue: 1,{_ts(0)},{_ts(hook_duration)},Hook,,0,0,0,,{_wrap(hook_text, hk['max_chars_per_line'])}")
 
     hl = p.get("highlight")
+    orig_size = max(1, round(p["size"] * ORIGINAL_FONT_SCALE))
     for line in lines:
+        if line.original:
+            body = f"{{\\fs{orig_size}}}{sanitize_ass_text(line.original)}{{\\r}}\\N{sanitize_ass_text(line.text)}"
+            out.append(f"Dialogue: 0,{_ts(line.start)},{_ts(line.end)},Sub,,0,0,0,,{body}")
+            continue
         if not hl or line.edited or not line.words:
             out.append(f"Dialogue: 0,{_ts(line.start)},{_ts(line.end)},Sub,,0,0,0,,{sanitize_ass_text(line.text)}")
             continue
