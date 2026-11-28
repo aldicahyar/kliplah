@@ -302,3 +302,22 @@ def test_create_upload_with_ranges_rejected(engine, settings, tmp_path):
                                 ranges=[[0, 60]], settings=settings)
     assert e.value.code == "VALIDATION" and e.value.status == 422
     assert src.exists()
+
+
+def test_create_project_normalizes_source_language(engine, settings):
+    default_proj = projects.create_project(engine, url=URL, settings=settings)
+    assert default_proj.source_language is None
+
+    ko = projects.create_project(engine, url=URL, source_language="KO", settings=settings)
+    assert ko.source_language == "ko"
+
+    region = projects.create_project(engine, url=URL, source_language="en-US", settings=settings)
+    assert region.source_language == "en"
+
+    auto = projects.create_project(engine, url=URL, source_language="auto", settings=settings)
+    assert auto.source_language is None
+
+    with pytest.raises(AppError) as e:
+        projects.create_project(engine, url=URL, source_language="xx", settings=settings)
+    assert e.value.code == "VALIDATION" and e.value.status == 422
+

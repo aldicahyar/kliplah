@@ -71,10 +71,11 @@ def _safe(name: str) -> str:
 def transcript_dir(settings: Settings, project: Project) -> Path:
     """`projects/<id>/transcripts/<source>/`: transcript and analysis checkpoints for the project's source."""
     src = project.transcript_source
+    lang = _safe(project.source_language or project.target_language)
     if src == "youtube_manual":
-        sub = f"youtube-manual-{_safe(project.target_language)}"
+        sub = f"youtube-manual-{lang}"
     elif src == "youtube_auto":
-        sub = f"youtube-auto-{_safe(project.target_language)}"
+        sub = f"youtube-auto-{lang}"
     else:  # "auto" (S1 projects) and "whisper" share the Whisper folder
         sub = _safe(project.whisper_model)
     return Path(settings.data_dir) / "projects" / project.id / "transcripts" / sub
@@ -117,9 +118,11 @@ def default_download_subs(video_id: str, lang: str, kind: Literal["manual", "aut
 
 def default_transcribe(wav: Path, duration: float, tdir: Path, whisper_model: str,
                        corrections: list[tuple[str, str]],
-                       on_progress: Callable[[float], None] | None = None) -> Transcript:
-    return transcribe(wav, duration, tdir, FasterWhisperTranscriber(whisper_model), whisper_model, corrections,
-                      on_progress=on_progress)
+                       on_progress: Callable[[float], None] | None = None,
+                       language: str | None = None, target_language: str = "id") -> Transcript:
+    transcriber = FasterWhisperTranscriber(whisper_model, language=language, target_language=target_language)
+    return transcribe(wav, duration, tdir, transcriber, whisper_model, corrections,
+                      on_progress=on_progress, language=language)
 
 
 def default_signals(project: Project, meta: VideoMeta, smap: SourceMap, settings: Settings) -> Signals:
@@ -297,6 +300,17 @@ class _Run:
         queue.set_progress(self.session, self.job_id, "transcribe", 1.0)
         return t
 
+    def _call_transcribe(self, wav: Path, duration: float, tdir: Path, model: str,
+                         corrections: list[tuple[str, str]], on_progress: Callable[[float], None],
+                         language: str | None) -> Transcript:
+        params = inspect.signature(self.deps.transcribe).parameters
+        has_varkw = any(v.kind == inspect.Parameter.VAR_KEYWORD for v in params.values())
+        extra: dict[str, str | None] = {}
+        for k, v in (("language", language), ("target_language", self.project.target_language)):
+            if has_varkw or (k in params and params[k].kind != inspect.Parameter.POSITIONAL_ONLY):
+                extra[k] = v
+        return self.deps.transcribe(wav, duration, tdir, model, corrections, on_progress=on_progress, **extra)
+
     def stage_transcribe(self) -> None:
         self.tdir.mkdir(parents=True, exist_ok=True)
         corrections = load_corrections(Path(self.settings.data_dir) / "corrections.json")
@@ -304,28 +318,38 @@ class _Run:
             self._transcript = self._transcribe_youtube_subs(corrections)
             return
         model = self.project.whisper_model
+        lang = self.project.source_language
         if not self.ranged:
-            self._transcript = self.deps.transcribe(
+            self._transcript = self._call_transcribe(
                 self.dir / "audio.wav", self.meta.duration, self.tdir, model, corrections,
-                on_progress=lambda p: queue.set_progress(self.session, self.job_id, "transcribe", p))
-            return
-        files = SourceMap.from_meta(self.meta, self.dir).files
-        total = sum(rf.end - rf.start for rf in files)
-        done = 0.0
-        parts: list[tuple[RangeFile, list[Word]]] = []
-        for rf in files:
-            length = round(rf.end - rf.start, 3)
-            out_dir = self.tdir / f"r{rf.index}"
-            out_dir.mkdir(parents=True, exist_ok=True)
+                lambda p: queue.set_progress(self.session, self.job_id, "transcribe", p), lang)
+            lang = self._transcript.language
+        else:
+            files = SourceMap.from_meta(self.meta, self.dir).files
+            total = sum(rf.end - rf.start for rf in files)
+            done = 0.0
+            parts: list[tuple[RangeFile, list[Word]]] = []
+            for rf in files:
+                length = round(rf.end - rf.start, 3)
+                out_dir = self.tdir / f"r{rf.index}"
+                out_dir.mkdir(parents=True, exist_ok=True)
 
-            def progress(p: float, base: float = done, length: float = length) -> None:
-                queue.set_progress(self.session, self.job_id, "transcribe", round((base + p * length) / total, 4))
+                def progress(p: float, base: float = done, length: float = length) -> None:
+                    queue.set_progress(self.session, self.job_id, "transcribe", round((base + p * length) / total, 4))
 
-            part = self.deps.transcribe(self.wav(rf), length, out_dir, model, corrections, on_progress=progress)
-            parts.append((rf, part.words))
-            done += length
-        self._transcript = merge_range_transcripts(parts, PAUSE_SPLIT_SEC, "id", self.meta.duration)
-        atomic_write_json(self.tdir / "transcript.json", self._transcript.model_dump())
+                part = self._call_transcribe(self.wav(rf), length, out_dir, model, corrections, progress, lang)
+                if lang is None and part.language:
+                    lang = part.language
+                parts.append((rf, part.words))
+                done += length
+            self._transcript = merge_range_transcripts(
+                parts, PAUSE_SPLIT_SEC, lang or self.project.target_language or "id", self.meta.duration)
+            atomic_write_json(self.tdir / "transcript.json", self._transcript.model_dump())
+        if self.project.source_language is None and lang:
+            self.save_project(source_language=lang)
+        meta = self.meta.model_copy(update={"source_language": lang or self.project.source_language})
+        atomic_write_json(self.dir / "meta.json", meta.model_dump())
+        self._meta = meta
 
     def stage_signals(self) -> None:
         smap = SourceMap.from_meta(self.meta, self.dir)

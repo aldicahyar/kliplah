@@ -12,6 +12,7 @@ from sqlmodel import Session, col, select
 from app.core.config import Settings, get_settings
 from app.db.engine import session_scope
 from app.db.tables import Clip, Job, Project, StyleTemplate, utcnow
+from app.domain.languages import normalize_language
 from app.domain.profiles import profile_for
 from app.domain.ranges import normalize_ranges
 from app.pipeline.ingest import IngestError, parse_youtube_id, probe_youtube
@@ -137,7 +138,8 @@ def probe(engine: Engine, url: str, *, ranges: list | None = None, target_langua
 
 def create_project(engine: Engine, *, url: str | None = None, upload_path: Path | None = None,
                    original_filename: str | None = None, content_type: str | None = None, ranges: list | None = None,
-                   focus_prompt: str | None = None, target_language: str = "id", transcript_source: str = "auto",
+                   focus_prompt: str | None = None, source_language: str | None = None,
+                   target_language: str = "id", transcript_source: str = "auto",
                    moment_source: str | None = None, max_clips: int | None = None, min_clip_sec: int | None = None,
                    max_clip_sec: int | None = None, style_template_id: str | None = None,
                    settings: Settings | None = None) -> Project:
@@ -159,6 +161,10 @@ def create_project(engine: Engine, *, url: str | None = None, upload_path: Path 
 
     if content_type is not None:
         _content_profile(content_type)
+    with domain_errors("source_language"):
+        if source_language is not None and not isinstance(source_language, str):
+            raise err("VALIDATION", "Bahasa sumber harus berupa teks.")
+        norm_source = normalize_language(source_language)
     if min_clip_sec is not None:
         _check_positive_int("min_clip_sec", min_clip_sec)
     if max_clip_sec is not None:
@@ -194,7 +200,7 @@ def create_project(engine: Engine, *, url: str | None = None, upload_path: Path 
             id=project_id, source_type="youtube" if url is not None else "upload",
             youtube_url=url.strip() if url is not None else None, video_id=video_id, original_filename=filename,
             content_type=resolved_type, ranges=stored_ranges, focus_prompt=focus_prompt,
-            target_language=target_language, transcript_source=transcript_source,
+            source_language=norm_source, target_language=target_language, transcript_source=transcript_source,
             moment_source=moment_source or app["moment_source"],
             max_clips=max_clips if max_clips is not None else app["max_clips"],
             min_clip_sec=min_sec, max_clip_sec=max_sec, style=copy.deepcopy(template.style),
