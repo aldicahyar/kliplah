@@ -1,4 +1,4 @@
-You are an expert short-form video editor. Below is the full transcript of an Indonesian podcast. Pick the moments that would work best as standalone vertical clips (TikTok, Instagram Reels, YouTube Shorts), and write the posting materials for each.
+You are an expert short-form video editor. Below is the full transcript of an Indonesian podcast. Pick the moments that would work best as standalone vertical clips (TikTok, Instagram Reels, YouTube Shorts), and write the posting materials for each.{{language_note}}
 
 What makes a moment worth clipping, from strongest to weakest:
 1. hook — an opening line that instantly grabs attention
@@ -38,7 +38,7 @@ Reply with only this JSON, nothing else:
       "hook": "teks hook maksimal 8 kata",
       "tiktok": {"title": "...", "caption": "...", "hashtags": ["#..."]},
       "reels":  {"title": "...", "caption": "...", "hashtags": ["#..."]},
-      "shorts": {"title": "...", "caption": "...", "hashtags": ["#..."]}
+      "shorts": {"title": "...", "caption": "...", "hashtags": ["#..."]}{{lines_field}}
     }
   ]
 }

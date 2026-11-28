@@ -17,11 +17,14 @@ from app.core.fs import atomic_write_json, project_dir, read_json
 from app.core.models import Transcript, VideoMeta
 from app.db.engine import session_scope
 from app.db.tables import Job, Project, utcnow
+from app.domain.languages import language_name
 from app.domain.profiles import profile_for
 from app.domain.ranges import SourceMap
+from app.domain.translation import load_translation, merge_lines, save_translation
 from app.pipeline.analyze import focus_block, import_external, profile_criteria_line, transcript_lines
 from app.pipeline.llm_json import parse_llm_json, render_prompt
 from app.pipeline.signals import load_signals
+from app.services.translation import needs_translation
 from app.worker import queue
 from app.worker.process import save_picks, transcript_dir
 
@@ -93,6 +96,23 @@ class _Ctx:
         return {"imported": have, "missing": [k for k in range(1, n + 1) if k not in have]}
 
 
+def _language_prompt_fields(t: Transcript, project: Project) -> tuple[str, str]:
+    """Return (language_note, lines_field) for `claude_manual`; empty strings when already target language."""
+    if not needs_translation(t.language, project.target_language):
+        return "", ""
+    lang_name = language_name(t.language, "id")
+    language_note = (
+        f"\n\nNOTE: Transkrip berbahasa {lang_name} (bukan Indonesia); tulis hook, reason, judul, "
+        "caption, dan hashtag dalam Bahasa Indonesia.\n"
+        'Untuk setiap klip, sertakan field "lines": array {"n": nomor_kalimat, "text": terjemahan_Indonesia} '
+        "untuk setiap kalimat dari start_sentence - 1 sampai end_sentence + 1. "
+        "Terjemahkan setia pada isi; nama orang, merek, dan istilah dibiarkan apa adanya; "
+        "jangan menambah informasi."
+    )
+    lines_field = ',\n      "lines": [{"n": 12, "text": "..."}]'
+    return language_note, lines_field
+
+
 def export_parts(engine: Engine, project_id: str, settings: Settings | None = None) -> list[dict]:
     settings = settings or get_settings()
     with Session(engine) as session:
@@ -107,10 +127,12 @@ def export_parts(engine: Engine, project_id: str, settings: Settings | None = No
     out = []
     criteria = profile_criteria_line(ctx.project.content_type)
     focus = focus_block(ctx.project.focus_prompt)
+    language_note, lines_field = _language_prompt_fields(ctx.transcript, ctx.project)
     for k, (a, b) in enumerate(ctx.parts, start=1):
         note = f"Ini bagian {k} dari {n}; hanya pakai kalimat [{a}]–[{b}]." if n > 1 else ""
         text = render_prompt("claude_manual", max_candidates=ctx.project.max_clips, min_sec=ctx.min_sec,
                              max_sec=ctx.max_sec, part_note=note, criteria=criteria, focus=focus,
+                             language_note=language_note, lines_field=lines_field,
                              transcript=transcript_lines(ctx.transcript, a, b + 1))
         name = _filename(k, n)
         ctx.tdir.mkdir(parents=True, exist_ok=True)
@@ -152,6 +174,28 @@ def import_part(engine: Engine, project_id: str, part: int, reply_text: str,
     return ctx.status()
 
 
+def collect_translation_lines(rows: list[dict]) -> dict[int, str]:
+    """Collect `{sentence_number: translated_text}` from `lines` arrays on imported clip objects."""
+    out: dict[int, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        lines = row.get("lines")
+        if not isinstance(lines, list):
+            continue
+        for item in lines:
+            if not isinstance(item, dict):
+                continue
+            n = item.get("n")
+            text = item.get("text")
+            if isinstance(n, bool) or not isinstance(n, int):
+                continue
+            if not isinstance(text, str):
+                continue
+            out[n] = text
+    return out
+
+
 def finish_moments(engine: Engine, project_id: str, allow_missing: bool = False,
                    settings: Settings | None = None) -> Job:
     """Merge the imported parts, keep the top clips by the M1 rules and queue `process` to continue at prepare."""
@@ -176,6 +220,12 @@ def finish_moments(engine: Engine, project_id: str, allow_missing: bool = False,
                                     signals=signals, content_type=p.content_type, source_map=smap)
         except ValueError as e:
             raise AppError("INVALID_IMPORT", str(e)) from e
+        if needs_translation(ctx.transcript.language, p.target_language):
+            collected = collect_translation_lines(rows)
+            if collected:
+                tr = load_translation(ctx.tdir, p.target_language, ctx.transcript.language)
+                if merge_lines(tr, collected, valid={s.i for s in ctx.transcript.sentences}) > 0:
+                    save_translation(ctx.tdir, tr)
         save_picks(ctx.dir / "picks.json", picks)
         p.last_completed_stage = "moments"
         p.status = "processing"

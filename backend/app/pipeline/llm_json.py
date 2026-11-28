@@ -66,7 +66,7 @@ def coerce_candidate(raw: dict, n_sentences: int, offset: int) -> dict | None:
 
 def render_prompt(name: str, **values) -> str:
     text = (PROMPTS_DIR / f"{name}.md").read_text(encoding="utf-8")
-    defaults = {"criteria": "", "focus": ""}
+    defaults = {"criteria": "", "focus": "", "language_note": "", "lines_field": ""}
     for k, v in {**defaults, **values}.items():
         text = text.replace("{{" + k + "}}", str(v))
     return text
