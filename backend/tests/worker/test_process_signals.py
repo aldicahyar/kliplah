@@ -65,8 +65,8 @@ def test_stream_profile_downloads_chat_podcast_does_not(engine, settings, monkey
     chat_calls = []
     loud_calls = []
 
-    def fake_dl_chat(vid, out, s, cookies_browser=""):
-        chat_calls.append(vid)
+    def fake_dl_chat(vid, out, s, cookies_browser="", until_sec=None):
+        chat_calls.append((vid, until_sec))
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text('{"replayChatItemAction":{"videoOffsetTimeMsec":"12000",'
                        '"actions":[{"addChatItemAction":{"item":{"liveChatTextMessageRenderer":'
@@ -93,7 +93,7 @@ def test_stream_profile_downloads_chat_podcast_does_not(engine, settings, monkey
         and (d / "source_r0.mp4", make_meta(proj))
     )
     assert run_process_job(engine, jid_s, deps_s) == "paused"
-    assert chat_calls == ["dQw4w9WgXcQ"] and loud_calls == ["audio_r0.wav"]
+    assert chat_calls == [("dQw4w9WgXcQ", 160.0)] and loud_calls == ["audio_r0.wav"]
     sigs = json.loads((settings.data_dir / "projects" / pid_s / "signals.json").read_text(encoding="utf-8"))
     assert sigs["audio"] and sigs["audio"][0]["start"] == pytest.approx(103.5)
     assert _rows(engine, pid_s, jid_s)[0].signals_available["audio_peak"] is True
@@ -258,3 +258,36 @@ def test_stage_moments_passes_legacy_sourcemap_extended_by_transcript(engine, se
     deps.analyze = fake_analyze
     assert run_process_job(engine, jid, deps) == "done"
     assert seen["source_map"].files[0].end == pytest.approx(120.8)
+
+
+def test_default_signals_passes_last_range_end_or_none(engine, settings, monkeypatch):
+    from app.domain.ranges import RangeFile, SourceMap
+
+    seen = []
+
+    def fake_dl_chat(vid, out, s, cookies_browser="", until_sec=None):
+        seen.append(until_sec)
+        return None
+
+    monkeypatch.setattr(process, "download_live_chat", fake_dl_chat)
+    pid, _ = _setup(engine, content_type="stream")
+    with Session(engine) as s:
+        proj = s.get(Project, pid)
+
+    pdir = settings.data_dir / "projects" / pid
+    ranged_meta = VideoMeta(
+        source_type="youtube", project_id=pid, title="R", duration=10800.0, video_id="dQw4w9WgXcQ",
+        has_live_chat=True,
+        ranges=[{"index": 0, "start": 100.0, "end": 200.0, "file": "source_r0.mp4"},
+                {"index": 1, "start": 1800.0, "end": 3600.0, "file": "source_r1.mp4"}],
+    )
+    process.default_signals(proj, ranged_meta, SourceMap.from_meta(ranged_meta, pdir), settings)
+    assert seen == [3600.0]
+
+    seen.clear()
+    full_meta = VideoMeta(
+        source_type="youtube", project_id=pid, title="F", duration=10800.0, video_id="dQw4w9WgXcQ",
+        has_live_chat=True, ranges=[],
+    )
+    process.default_signals(proj, full_meta, SourceMap.from_meta(full_meta, pdir), settings)
+    assert seen == [None]

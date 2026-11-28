@@ -534,6 +534,13 @@ def test_cli_probe_prints_estimate(env, monkeypatch, capsys):
     assert cli.main(["probe", URL, "--range", "00:30:00-01:00:00"]) == 0
     out = capsys.readouterr().out
     assert "Stream Panjang" in out and "26" in out
+    low = out.lower()
+    for word in ("unduh", "encode", "transkrip", "chat", "llm"):
+        assert word in low
+
+    assert cli.main(["probe", URL, "--range", "05:20:00-05:50:00", "--type", "stream", "--moments", "ollama"]) == 0
+    out2 = capsys.readouterr().out
+    assert "107" in out2 or "106" in out2 or "108" in out2 or "110" in out2
 
 
 def test_cli_age_restricted_exit_code_2(env, capsys):

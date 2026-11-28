@@ -332,3 +332,62 @@ def test_fallback_with_zero_scoring_signals_still_spreads_evenly():
     assert len(out) == 4 and all(c.score == 0 for c in out)
     quarters = [int(c.start // 1800) for c in out]
     assert sorted(quarters) == [0, 1, 2, 3]
+
+
+def test_normalize_scores_shifts_inflated_median_and_logs_warning(t, meta, tmp_path, caplog):
+    import logging
+    import statistics
+    from app.pipeline.analyze import normalize_scores
+
+    # Median 80 > 70 -> shift by -25 so median becomes 55; extreme low clamped at 0
+    inflated = [cand(t, 0, 5, llm=10), cand(t, 6, 11, llm=80), cand(t, 12, 17, llm=88)]
+    with caplog.at_level(logging.WARNING):
+        shifted = normalize_scores(inflated)
+    assert [c.llm_score for c in shifted] == [0, 55, 63]
+    assert statistics.median(c.llm_score for c in shifted) == 55
+    assert any("median" in rec.message.lower() for rec in caplog.records)
+
+    # Median <= 70 -> untouched, no warning
+    caplog.clear()
+    normal = [cand(t, 0, 5, llm=40), cand(t, 6, 11, llm=70), cand(t, 12, 17, llm=85)]
+    with caplog.at_level(logging.WARNING):
+        kept = normalize_scores(normal)
+    assert [c.llm_score for c in kept] == [40, 70, 85]
+    assert not caplog.records
+
+    # End-to-end analyze normalizes inflated run scores
+    llm = FakeLLM([found(0, 8, 82), MATERIALS])
+    out = analyze(t, meta, llm, max_clips=8, min_sec=30, max_sec=90, checkpoint_dir=tmp_path)
+    assert out[0][0].llm_score == 55
+
+
+def test_profanity_list_and_censor_hook_in_materials(t, meta, tmp_path):
+    from app.pipeline.analyze import censor_profanity, load_profanity_words
+
+    words = load_profanity_words()
+    expected = {"fuck", "shit", "bangsat", "anjing", "kontol", "memek", "bajingan", "tolol"}
+    assert expected.issubset(set(words))
+    assert all(w == w.lower() for w in words)
+
+    assert censor_profanity("What the fuck is this") == "What the f*** is this"
+    assert censor_profanity("Fuck! Bangsat beneran, shit") == "F***! B****** beneran, s***"
+    # Whole word only: substrings must not be censored
+    assert censor_profanity("Tolong pegang anjingku") == "Tolong pegang anjingku"
+
+    dirty_materials = json.dumps({
+        "hook": "Anjing kaget pas fuck meledak",
+        **{p: {"title": "Judul", "caption": "Caption", "hashtags": ["#game"]} for p in ("tiktok", "reels", "shorts")},
+    })
+    m = write_materials(cand(t, 0, 9), t, FakeLLM([dirty_materials]))
+    assert m.hook == "A***** kaget pas f*** meledak"
+
+    # Fallback default materials also censored when transcript contains profanity
+    t_dirty = t.model_copy(deep=True)
+    t_dirty.sentences[0] = t_dirty.sentences[0].model_copy(update={"text": "Wah tolol banget ini"})
+    m_fb = write_materials(cand(t_dirty, 0, 9), t_dirty, FakeLLM(["bad", "bad"]))
+    assert m_fb.hook.startswith("Wah t**** banget ini")
+
+    # analyze propagates censored hook to both Candidate and Materials
+    out = analyze(t, meta, FakeLLM([found(0, 8, 60), dirty_materials]), 8, 30, 90, tmp_path)
+    assert out[0][1].hook == "A***** kaget pas f*** meledak"
+    assert out[0][0].hook == "A***** kaget pas f*** meledak"

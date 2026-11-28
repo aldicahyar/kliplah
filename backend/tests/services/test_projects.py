@@ -229,6 +229,57 @@ def test_probe_estimate_includes_encode_time(engine, settings, monkeypatch):
     full = projects.probe(engine, URL, settings=settings)
     assert full["estimate"]["process_minutes"] == 6
     assert full["estimate"]["disk_gb"] == 16.1
+    assert set(full["estimate"]["breakdown"]) == {
+        "download_min", "encode_min", "transcribe_min", "chat_min", "llm_min",
+    }
+    assert full["estimate"]["process_minutes"] == sum(full["estimate"]["breakdown"].values())
+
+
+def test_probe_breakdown_stream_ollama_30m_range_and_profiles(engine, settings, monkeypatch):
+    from app.core.models import VideoMeta
+    from app.db.engine import session_scope
+    from app.services.settings_store import put_app_settings
+
+    assert projects.CHAT_SEC_PER_HOUR == pytest.approx(300.0)
+    assert projects.LLM_SEC_PER_WINDOW == pytest.approx(480.0)
+    assert projects.LLM_SEC_PER_CLIP == pytest.approx(25.0)
+
+    meta = VideoMeta(
+        source_type="youtube", project_id="vid_tara", title="Tara Arts GTA", channel="Tara",
+        duration=31380.0, video_id="vid_tara", subtitles={"manual": [], "auto": ["id"]},
+        has_live_chat=True,
+    )
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": meta)
+
+    with session_scope(engine) as s:
+        put_app_settings(s, {"content_type": "stream", "moment_source": "ollama", "max_clips": 8}, settings=settings)
+
+    # 30-min range at 05:20-05:50 (19200-21000) -> ~110 min (20% tolerance)
+    ranged = projects.probe(engine, URL, ranges=[[19200, 21000]], settings=settings)
+    est = ranged["estimate"]
+    b = est["breakdown"]
+    assert set(b) == {"download_min", "encode_min", "transcribe_min", "chat_min", "llm_min"}
+    assert est["process_minutes"] == sum(b.values())
+    assert 88 <= est["process_minutes"] <= 132
+    assert b["chat_min"] > 0 and b["llm_min"] > 0
+
+    # claude_manual sets llm_min = 0, keeps chat_min
+    manual = projects.probe(engine, URL, ranges=[[19200, 21000]], moment_source="claude_manual", settings=settings)
+    assert manual["estimate"]["breakdown"]["llm_min"] == 0
+    assert manual["estimate"]["breakdown"]["chat_min"] == b["chat_min"]
+    assert manual["estimate"]["process_minutes"] == sum(manual["estimate"]["breakdown"].values())
+
+    # variety uses live_chat; podcast does not
+    variety = projects.probe(engine, URL, ranges=[[19200, 21000]], content_type="variety", settings=settings)
+    podcast = projects.probe(engine, URL, ranges=[[19200, 21000]], content_type="podcast", settings=settings)
+    assert variety["estimate"]["breakdown"]["chat_min"] > 0
+    assert podcast["estimate"]["breakdown"]["chat_min"] == 0
+
+    # No live chat on video -> chat_min = 0 even for stream
+    no_chat_meta = meta.model_copy(update={"has_live_chat": False})
+    monkeypatch.setattr(projects, "probe_youtube", lambda url, s, cookies_browser="": no_chat_meta)
+    no_chat = projects.probe(engine, URL, ranges=[[19200, 21000]], content_type="stream", settings=settings)
+    assert no_chat["estimate"]["breakdown"]["chat_min"] == 0
 
 
 def test_create_project_normalizes_ranges(engine, settings):

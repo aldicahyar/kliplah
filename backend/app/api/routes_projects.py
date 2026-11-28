@@ -39,6 +39,9 @@ class ProjectCreate(ProjectOptions):
 class ProbeRequest(BaseModel):
     url: str
     ranges: list | None = None
+    content_type: str | None = None
+    moment_source: str | None = None
+    max_clips: int | None = None
 
 
 class ManualClip(BaseModel):
@@ -54,7 +57,15 @@ def _created(engine: Engine, project) -> dict:
 @router.post("/probe")
 def probe_project(body: ProbeRequest, engine: Engine = Depends(get_engine_dep),
                   settings: Settings = Depends(get_settings_dep)) -> dict:
-    return projects.probe(engine, body.url, ranges=body.ranges, settings=settings)
+    return projects.probe(
+        engine,
+        body.url,
+        ranges=body.ranges,
+        content_type=body.content_type,
+        moment_source=body.moment_source,
+        max_clips=body.max_clips,
+        settings=settings,
+    )
 
 
 @router.post("", status_code=201)

@@ -130,8 +130,9 @@ def default_signals(project: Project, meta: VideoMeta, smap: SourceMap, settings
     vid = meta.video_id or project.video_id
     if "live_chat" in profile.signals and meta.has_live_chat and vid:
         try:
+            until_sec = smap.files[-1].end if meta.ranges and smap.files else None
             chat_path = download_live_chat(vid, pdir / "live_chat.json", settings,
-                                           cookies_browser=_cookies_browser(settings))
+                                           cookies_browser=_cookies_browser(settings), until_sec=until_sec)
             if chat_path is not None:
                 msgs = parse_live_chat(chat_path)
                 chat_list = chat_peaks(msgs, meta.duration, load_chat_keywords())

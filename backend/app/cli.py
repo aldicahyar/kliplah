@@ -335,7 +335,15 @@ def cmd_migrate(args, settings: Settings) -> Path:
 
 def cmd_probe(args, settings: Settings) -> Path:
     engine = _engine(settings)
-    info = projects.probe(engine, args.url, ranges=_parse_ranges(args.range), settings=settings)
+    info = projects.probe(
+        engine,
+        args.url,
+        ranges=_parse_ranges(args.range),
+        content_type=args.type,
+        moment_source=MOMENT_SOURCES[args.moments] if args.moments else None,
+        max_clips=args.max_clips,
+        settings=settings,
+    )
     subs = info["subtitles"]
     print(f"Judul: {info['title']} ({info['channel'] or '-'})")
     print(f"Durasi: {info['duration']:.0f} detik | Heatmap: {'ya' if info['has_heatmap'] else 'tidak'} | "
@@ -344,7 +352,10 @@ def cmd_probe(args, settings: Settings) -> Path:
           f"auto: {', '.join(subs.get('auto') or []) or '-'}")
     print(f"Sumber transkrip otomatis: {info['transcript_source_auto']}")
     est = info["estimate"]
-    print(f"Perkiraan: ~{est['process_minutes']} menit proses, ~{est['disk_gb']} GB disk")
+    b = est["breakdown"]
+    print(f"Perkiraan: ~{est['process_minutes']} menit proses "
+          f"(unduh {b['download_min']}m, encode {b['encode_min']}m, transkrip {b['transcribe_min']}m, "
+          f"chat {b['chat_min']}m, LLM {b['llm_min']}m), ~{est['disk_gb']} GB disk")
     for w in info["warnings"]:
         print(f"Peringatan: {w}")
     return Path(settings.data_dir)
@@ -423,6 +434,10 @@ def _parser() -> argparse.ArgumentParser:
     pr.add_argument("url", help="link YouTube")
     pr.add_argument("--range", action="append", default=None, metavar="HH:MM:SS-HH:MM:SS",
                     help="rentang waktu untuk menghitung perkiraan (boleh diulang)")
+    pr.add_argument("--type", default=None, help="jenis konten (podcast, stream, variety, news, general)")
+    pr.add_argument("--moments", choices=sorted(MOMENT_SOURCES), default=None,
+                    help="pemilih momen (default: pengaturan aplikasi)")
+    pr.add_argument("--max-clips", type=int, default=None, help="jumlah klip maksimal untuk perkiraan LLM")
     cfg = sub.add_parser("config", help="lihat atau ubah pengaturan aplikasi (mis. cookies_browser)")
     cfg.add_argument("action", choices=("get", "set"))
     cfg.add_argument("key", nargs="?", default=None)

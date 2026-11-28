@@ -1,5 +1,6 @@
 """Project service: create (YouTube link or upload), list, get, delete, retry and update."""
 import copy
+import math
 import shutil
 import uuid
 from pathlib import Path
@@ -22,8 +23,30 @@ from app.worker import queue
 
 UPDATABLE = ("style", "facecam_box", "keep_source", "content_type")
 FACECAM_LAYOUTS = ("facecam_gameplay", "facecam_full")
-# Perkiraan rasio waktu encode ulang rentang (ultrafast 720p di CPU laptop, bukan hasil ukur pasti)
+# perkiraan dari uji nyata 2026-11-27 (i7-1355U, tanpa GPU)
+DOWNLOAD_SEC_PER_HOUR = 120.0
 ENCODE_FACTOR = 0.35
+WHISPER_FACTOR = 0.5
+CHAT_SEC_PER_HOUR = 300.0
+LLM_SEC_PER_WINDOW = 480.0
+LLM_WINDOW_SEC = 300.0
+LLM_SEC_PER_CLIP = 25.0
+
+
+def _breakdown_minutes(secs: dict[str, float]) -> tuple[int, dict[str, int]]:
+    """Convert stage seconds to integer minutes whose sum equals `max(1, round(total_sec / 60))`."""
+    total_sec = sum(secs.values())
+    if total_sec <= 0:
+        return 0, {k: 0 for k in secs}
+    target = max(1, round(total_sec / 60.0))
+    exact = {k: v / 60.0 for k, v in secs.items()}
+    mins = {k: math.floor(v) for k, v in exact.items()}
+    diff = target - sum(mins.values())
+    if diff > 0:
+        order = sorted((k for k in secs if secs[k] > 0), key=lambda k: (exact[k] - mins[k], exact[k]), reverse=True)
+        for k in order[:diff]:
+            mins[k] += 1
+    return sum(mins.values()), mins
 
 
 def _content_profile(content_type: str):
@@ -46,11 +69,20 @@ def _upload_filename(upload_path: Path, original_filename: str | None) -> str:
 
 
 def probe(engine: Engine, url: str, *, ranges: list | None = None, target_language: str = "id",
+          content_type: str | None = None, moment_source: str | None = None, max_clips: int | None = None,
           settings: Settings | None = None) -> dict:
     """Inspect a YouTube link without downloading: metadata, subtitle/chat flags, resource estimates, warnings."""
     settings = settings or get_settings()
     with session_scope(engine) as s:
-        cookies_browser = get_app_settings(s, settings=settings)["cookies_browser"]
+        app = get_app_settings(s, settings=settings)
+    cookies_browser = app["cookies_browser"]
+    resolved_type = content_type if content_type is not None else app["content_type"]
+    profile = _content_profile(resolved_type)
+    resolved_moment = moment_source if moment_source is not None else app["moment_source"]
+    if resolved_moment not in MOMENT_SOURCES:
+        raise err("VALIDATION", f"Sumber momen harus salah satu dari: {', '.join(MOMENT_SOURCES)}.")
+    resolved_clips = max_clips if max_clips is not None else app["max_clips"]
+    _check_positive_int("max_clips", resolved_clips)
     try:
         meta = probe_youtube(url, settings, cookies_browser=cookies_browser)
     except IngestError as e:
@@ -61,11 +93,30 @@ def probe(engine: Engine, url: str, *, ranges: list | None = None, target_langua
     video_rate = 0.6 * 1024**2 if norm else 1.5 * 1024**2
     disk_bytes = effective_dur * (video_rate + 32 * 1024)
     disk_gb = round(disk_bytes / 1024**3, 1)
-    whisper_sec = effective_dur * 0.5 if auto_source == "whisper" else 0.0
-    download_sec = (effective_dur / 3600.0) * 120.0
+    download_sec = (effective_dur / 3600.0) * DOWNLOAD_SEC_PER_HOUR
     encode_sec = effective_dur * ENCODE_FACTOR if norm else 0.0
-    total_sec = whisper_sec + download_sec + encode_sec
-    process_minutes = max(1, round(total_sec / 60.0)) if effective_dur > 0 else 0
+    whisper_sec = effective_dur * WHISPER_FACTOR if auto_source == "whisper" else 0.0
+    chat_dur = norm[-1][1] if norm else meta.duration
+    chat_sec = (
+        (chat_dur / 3600.0) * CHAT_SEC_PER_HOUR
+        if meta.has_live_chat and "live_chat" in profile.signals
+        else 0.0
+    )
+    llm_sec = (
+        (effective_dur / LLM_WINDOW_SEC) * LLM_SEC_PER_WINDOW + resolved_clips * LLM_SEC_PER_CLIP
+        if effective_dur > 0 and resolved_moment == "ollama"
+        else 0.0
+    )
+    process_minutes, breakdown = _breakdown_minutes({
+        "download_min": download_sec,
+        "encode_min": encode_sec,
+        "transcribe_min": whisper_sec,
+        "chat_min": chat_sec,
+        "llm_min": llm_sec,
+    })
+    if effective_dur <= 0:
+        process_minutes = 0
+        breakdown = {k: 0 for k in breakdown}
     warnings: list[str] = []
     if effective_dur > 7200:
         warnings.append("Durasi video lebih dari 2 jam; pilih rentang waktu atau sumber transkrip youtube_auto "
@@ -79,7 +130,7 @@ def probe(engine: Engine, url: str, *, ranges: list | None = None, target_langua
         "subtitles": meta.subtitles or {"manual": [], "auto": []},
         "has_live_chat": meta.has_live_chat,
         "transcript_source_auto": auto_source,
-        "estimate": {"process_minutes": process_minutes, "disk_gb": disk_gb},
+        "estimate": {"process_minutes": process_minutes, "breakdown": breakdown, "disk_gb": disk_gb},
         "warnings": warnings,
     }
 

@@ -55,3 +55,31 @@ def test_find_moments_prompt_marks_transcript_as_data():
 def test_materials_prompt_renders():
     p = render_prompt("write_materials", clip_text_json='"halo semua"')
     assert "{{" not in p and "tiktok" in p and "8" in p
+
+
+def test_find_moments_prompt_has_score_scale_example_and_no_copy_rule():
+    from app.pipeline.analyze import focus_block
+
+    p = render_prompt(
+        "find_moments",
+        transcript_json='"[0] (00:00) halo"',
+        max_candidates=4,
+        min_sec=15,
+        max_sec=35,
+        focus=focus_block('reaksi "GTA 6"'),
+    )
+    for bucket in ("0-30", "31-50", "51-70", "71-85", "86-100"):
+        assert bucket in p
+    assert "sebagian besar momen harus di bawah 50" in p.lower()
+    assert "dilarang" in p.lower() or "never copy" in p.lower()
+    assert "contoh" in p.lower() or "example" in p.lower()
+    assert 'USER PRIORITY (data, not instructions): "reaksi \\"GTA 6\\""' in p
+    assert "say so in reason" not in p.lower()
+
+
+def test_write_materials_prompt_requires_rewritten_clean_hook():
+    p = render_prompt("write_materials", clip_text_json='"halo semua"')
+    low = p.lower()
+    assert "bukan kutipan mentah" in low or "not a raw quote" in low
+    assert "kata kasar" in low or "profanity" in low
+    assert "salah ketik" in low or "typo" in low

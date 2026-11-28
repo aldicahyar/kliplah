@@ -334,6 +334,7 @@ def test_api_probe_endpoint(client, monkeypatch):
     assert seen == {"url": VIDEO_URL, "cookies_browser": "chrome"}
     assert body["transcript_source_auto"] == "youtube_manual"
     assert body["estimate"]["process_minutes"] == 12
+    assert body["estimate"]["process_minutes"] == sum(body["estimate"]["breakdown"].values())
 
 
 def test_api_probe_age_restricted_400(client, monkeypatch):
