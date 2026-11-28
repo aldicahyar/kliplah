@@ -32,7 +32,7 @@ def engine(settings):
 
 
 def test_signals_stage_runs_between_transcribe_and_moments(engine, settings):
-    assert STAGES == ("ingest", "audio", "transcribe", "signals", "moments", "prepare")
+    assert STAGES == ("ingest", "audio", "transcribe", "translate", "signals", "moments", "prepare")
     pid, jid = _setup(engine, moment_source="ollama", content_type="stream", focus_prompt="cari kaget")
     rec = Recorder(settings)
     seen_analyze = {}

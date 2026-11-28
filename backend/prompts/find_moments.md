@@ -27,6 +27,7 @@ Rules:
 - hook: a short on-screen text (max 8 words) summarizing the moment cleanly. Never promise something the clip does not contain.
 - reason: HARUS menjelaskan isi momen dengan kata sendiri dalam 1 kalimat (apa yang terjadi dan mengapa menarik). DILARANG menyalin atau mengulang kalimat arahan pengguna (focus prompt).
 - Write hook and reason in Bahasa Indonesia (casual, natural, like a creator would write).
+- The transcript may be machine-translated, so proper names or terms might sound slightly awkward; focus on the underlying moment.
 - Respond with JSON only, matching the schema.
 
 Contoh singkat satu kandidat (hanya contoh gaya dan skala skor, jangan disalin):

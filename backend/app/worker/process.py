@@ -1,4 +1,4 @@
-"""The staged `process` job: ingest -> audio -> transcribe -> signals -> moments -> prepare.
+"""The staged `process` job: ingest -> audio -> transcribe -> translate -> signals -> moments -> prepare.
 
 Stage logic is lifted from the M1 CLI (`prepare_project` / `process_project`) and keeps its checkpoints:
 `projects/<id>/meta.json`, `silences.json`, `signals.json`, `transcripts/<model>/` (transcript + analysis checkpoints).
@@ -19,11 +19,13 @@ from sqlmodel import Session
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.core.fs import atomic_write_json, project_dir, read_json
-from app.core.models import Candidate, Materials, Transcript, VideoMeta, Word
+from app.core.models import Candidate, Materials, Sentence, Transcript, VideoMeta, Word
 from app.db.engine import get_engine, session_scope
 from app.db.tables import Job, Project, utcnow
+from app.domain.languages import normalize_language
 from app.domain.profiles import profile_for
 from app.domain.ranges import RangeFile, SourceMap
+from app.domain.translation import load_translation, merge_lines, missing_sentences, save_translation, translated_view
 from app.pipeline.analyze import analyze
 from app.pipeline.audio import detect_silences, extract_audio
 from app.pipeline.audio_peaks import audio_loudness, audio_peaks
@@ -34,6 +36,7 @@ from app.pipeline.render import RenderError
 from app.pipeline.sentences import PAUSE_SPLIT_SEC
 from app.pipeline.signals import Signals, load_signals, save_signals
 from app.pipeline.transcribe import merge_range_transcripts, transcribe
+from app.pipeline.translate import translate_sentences
 from app.pipeline.youtube_subs import (
     SUBTITLE_PAUSE_SPLIT_SEC,
     clip_words_to_ranges,
@@ -41,14 +44,14 @@ from app.pipeline.youtube_subs import (
     parse_json3,
     resolve_subtitle_plan,
 )
-from app.providers.llm import OllamaClient
+from app.providers.llm import LLMUnavailable, OllamaClient
 from app.providers.transcriber import FasterWhisperTranscriber
 from app.services.settings_store import get_app_settings
 from app.worker import queue
 
 log = logging.getLogger("kliplah.process")
 
-STAGES = ("ingest", "audio", "transcribe", "signals", "moments", "prepare")
+STAGES = ("ingest", "audio", "transcribe", "translate", "signals", "moments", "prepare")
 Pick = tuple[Candidate, Materials]
 Outcome = Literal["done", "paused", "yield"]
 
@@ -125,6 +128,19 @@ def default_transcribe(wav: Path, duration: float, tdir: Path, whisper_model: st
                       on_progress=on_progress, language=language)
 
 
+def default_translate(
+    sentences: list[Sentence],
+    source: str,
+    target: str,
+    checkpoint_dir: Path,
+    settings: Settings,
+    on_progress: Callable[[float], None] | None = None,
+) -> tuple[dict[int, str], list[int]]:
+    """Translate transcript sentences via Ollama with batch checkpoints."""
+    llm = OllamaClient(settings.ollama_url, settings.ollama_model)
+    return translate_sentences(sentences, source, target, llm, checkpoint_dir, on_progress=on_progress)
+
+
 def default_signals(project: Project, meta: VideoMeta, smap: SourceMap, settings: Settings) -> Signals:
     """Collect profile-relevant signals (live chat and audio peaks) on the original video timeline."""
     profile = profile_for(project.content_type)
@@ -184,9 +200,22 @@ class ProcessDeps:
     detect_silences: Callable[[Path], list[tuple[float, float]]] = detect_silences
     transcribe: Callable[..., Transcript] = default_transcribe
     download_subs: Callable[..., Path] = default_download_subs
+    translate: Callable[
+        [list[Sentence], str, str, Path, Settings, Callable[[float], None] | None],
+        tuple[dict[int, str], list[int]],
+    ] = default_translate
     signals: Callable[[Project, VideoMeta, SourceMap, Settings], Signals] = default_signals
     analyze: Callable[..., list[Pick]] = default_analyze
     prepare: Callable[[Engine, str, list[Pick]], None] = default_prepare
+
+
+def _norm_lang(code: str | None) -> str:
+    if not code:
+        return ""
+    try:
+        return normalize_language(code) or code.strip().lower()
+    except AppError:
+        return code.strip().lower()
 
 
 def to_app_error(e: Exception) -> AppError:
@@ -364,6 +393,42 @@ class _Run:
         atomic_write_json(self.dir / "meta.json", meta.model_dump())
         self._meta = meta
 
+    @property
+    def needs_translation(self) -> bool:
+        return _norm_lang(self.transcript.language) != _norm_lang(self.project.target_language)
+
+    def stage_translate(self) -> None:
+        if self.project.moment_source != "ollama" or not self.needs_translation:
+            return
+        source = self.transcript.language
+        target = self.project.target_language
+        tr = load_translation(self.tdir, target, source)
+        missing = missing_sentences(self.transcript, tr)
+        if not missing:
+            queue.set_progress(self.session, self.job_id, "translate", 1.0)
+            return
+        try:
+            translated, failed = self.deps.translate(
+                missing,
+                source,
+                target,
+                self.tdir / "checkpoints",
+                self.settings,
+                lambda p: queue.set_progress(self.session, self.job_id, "translate", p),
+            )
+        except LLMUnavailable as e:
+            raise AppError(
+                "OLLAMA_UNAVAILABLE",
+                f"Ollama tidak tersedia ({e}); gunakan moment_source claude_manual atau nyalakan Ollama.",
+                retryable=True,
+            ) from e
+        merge_lines(tr, translated, valid={s.i for s in self.transcript.sentences})
+        save_translation(self.tdir, tr)
+        queue.set_progress(self.session, self.job_id, "translate", 1.0)
+        if failed:
+            log.warning("%d kalimat gagal diterjemahkan untuk project %s; teks asli dipertahankan.",
+                        len(failed), self.project.id)
+
     def stage_signals(self) -> None:
         smap = SourceMap.from_meta(self.meta, self.dir)
         sig_path = self.dir / "signals.json"
@@ -387,14 +452,19 @@ class _Run:
         min_sec = p.min_clip_sec or profile.min_sec
         max_sec = p.max_clip_sec or profile.max_sec
         ck = self.tdir / "checkpoints"
+        t = (
+            translated_view(self.transcript, load_translation(self.tdir, p.target_language, self.transcript.language))
+            if self.needs_translation
+            else self.transcript
+        )
         params = inspect.signature(self.deps.analyze).parameters
         accepts_kw = "signals" in params or any(v.kind == inspect.Parameter.VAR_KEYWORD for v in params.values())
         if accepts_kw:
-            picks = self.deps.analyze(self.transcript, self.meta, p.max_clips, min_sec, max_sec, ck, self.settings,
+            picks = self.deps.analyze(t, self.meta, p.max_clips, min_sec, max_sec, ck, self.settings,
                                       signals=sigs, content_type=p.content_type, focus_prompt=p.focus_prompt,
                                       source_map=smap)
         else:
-            picks = self.deps.analyze(self.transcript, self.meta, p.max_clips, min_sec, max_sec, ck, self.settings)
+            picks = self.deps.analyze(t, self.meta, p.max_clips, min_sec, max_sec, ck, self.settings)
         save_picks(self.dir / "picks.json", picks)
 
     def stage_prepare(self) -> None:

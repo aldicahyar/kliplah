@@ -110,7 +110,7 @@ def _rows(engine, pid, jid) -> tuple[Project, Job]:
 
 
 def test_stages_constant():
-    assert STAGES == ("ingest", "audio", "transcribe", "signals", "moments", "prepare")
+    assert STAGES == ("ingest", "audio", "transcribe", "translate", "signals", "moments", "prepare")
 
 
 def test_process_runs_all_stages_with_ollama_source(engine, settings):
